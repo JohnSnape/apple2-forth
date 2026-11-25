@@ -1,0 +1,21 @@
+DECIMAL
+: DOUBLED 2 * ;
+: TRIPLED 3 * ;
+: HALVED 2 / ;
+: AVERAGE + 2 / ;
+: PERCENT 100 */ ;
+: SUMTO DUP 1 + * 2 / ;
+: SQ DUP * ;
+: HYPOT2 SQ SWAP SQ + ;
+: PI* 355 113 */ ;
+: DIAMETER 2 * ;
+: CIRCUM DIAMETER PI* ;
+: AREA SQ PI* ;
+: F>C 32 - 5 9 */ ;
+: C>F 9 5 */ 32 + ;
+: MILES>KM 1609 1000 */ ;
+: KM>MILES 1000 1609 */ ;
+: LBS>KG 4536 10000 */ ;
+: KG>LBS 10000 4536 */ ;
+: INCH>MM 254 10 */ ;
+: MM>INCH 10 254 */ ;

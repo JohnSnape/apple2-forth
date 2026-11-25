@@ -1,0 +1,1364 @@
+*=============================================
+* FORTH.GFX - relocatable hi-res module
+*
+* Assembled at ORG 0 and loaded wherever the
+* dictionary happens to start. Everything in
+* the file is an offset from the load address,
+* the ten byte header included, and MODLD adds
+* that address to every word named in the fixup
+* list at the end.
+*
+* Only addresses INSIDE this module are listed.
+* Kernel routines go through the jump table at
+* $0800, hardware addresses are fixed, and
+* branches are relative - none of those move.
+*=============================================
+ xc                     ; 65C02 opcodes
+*
+*---- kernel jump table, frozen at $0800 ----
+kpush equ $0803         ; A=hi Y=lo -> stack
+kpop equ $0806          ; stack -> A=hi Y=lo
+kpeek equ $0809
+knext equ $080c         ; the inner interpreter
+kdocol equ $080f
+kemit equ $0812         ; print the char in A
+*
+*---- module communication block ----
+* LOAD fills these in when it recognises a
+* file called something.SHP. Both are zero
+* when no shape file has been loaded.
+shpadr equ $0825        ; where the shapes are
+shpend equ $0827        ; first byte past them
+*
+*---- ROM and soft switches ----
+pread equ $fb1e         ; X=paddle, returns Y
+txtclr equ $c050        ; graphics
+txtset equ $c051        ; text
+mixclr equ $c052        ; full screen
+mixset equ $c053        ; four lines of text
+lowscr equ $c054        ; show page 1
+hiscr equ $c055         ; show page 2
+lores equ $c056         ; lo-res
+hires equ $c057
+btn0 equ $c061
+btn1 equ $c062
+btn2 equ $c063
+*
+*---- line tables, built by GFINIT ----
+* Fixed addresses in RAM nothing else uses, so
+* none of them needs a fixup, and 432 bytes of
+* table cost the module nothing.
+hrlo equ $7a00          ; 192 hi-res low bytes
+hrhi equ $7ac0          ; 192 hi-res high bytes
+lorlo equ $7b80         ; 24 lo-res low bytes
+lorhi equ $7b98         ; 24 lo-res high bytes
+*
+*---- zero page ----
+* Clear of the kernel ($06-$bd, $e0, $e5,
+* $eb-$ee, $f0-$fc) and of the module loader
+* ($be-$cb), which has finished by the time we
+* run. Note the gaps at $e0 and $e5.
+hptr equ $cc            ; screen address
+hx equ $ce              ; current x, 16 bits
+hy equ $d0              ; current y
+hcolr equ $d1           ; colour byte
+hmask equ $d2           ; pixel mask
+hold equ $d3            ; the byte we found
+hpg equ $d4             ; $20 or $40
+gt2 equ $d5             ; divide working
+gt3 equ $d7             ; byte offset
+gt1 equ $d8             ; general pointer
+*
+* HLINE and DRAW share the rest. They are never
+* active at the same time, so the storage is
+* deliberately overlaid.
+hx2 equ $da             ; HLINE: end x
+hy2 equ $dc             ; HLINE: end y
+hdx equ $dd             ; HLINE: delta x
+hdy equ $df             ; HLINE: delta y
+herr equ $e1            ; HLINE: error term
+he2 equ $e3             ; HLINE: twice the error
+hsx equ $e6             ; HLINE: x step
+hsy equ $e7             ; HLINE: y step
+shptr equ $da           ; DRAW: shape table
+shght equ $dc           ; DRAW: rows left
+shwid equ $dd           ; DRAW: bytes a row
+shidx equ $de           ; DRAW: index in table
+shcnt equ $df           ; SHAPE: shapes to skip
+shsz equ $e1            ; SHAPE: size of one shape
+*
+* $e8 and $e9 used to hold the shape file's
+* base address. LOAD keeps that in the
+* communication block now, so they are free.
+*
+*---- fixup count ----
+* How many DA lines the fixup list at the end
+* of this file holds.  The module header below
+* publishes it, and Merlin 8 resolves an EQU on
+* its first pass - so the number has to be
+* declared before the DA that reads it.  Add a
+* fixup down there, add one to this.
+nrel equ 143
+*
+ org 0
+*
+*=============================================
+* MODULE HEADER
+*=============================================
+ da gflast              ; newest word
+ da gffirst             ; oldest word
+ da gfend               ; end of the image
+ da gfinit              ; set-up routine
+ da nrel                ; how many fixups
+*
+*=============================================
+* GFINIT - build the line address tables
+*
+* Hi-res line L begins at
+*   $2000 + (L&7)*$400 + ((L>>3)&7)*$80
+*         + (L>>6)*$28
+* Programmer's Aid works that out every time it
+* plots. We do it 192 times here and then never
+* again - the whole difference between a
+* listing optimised for space and one optimised
+* for speed.
+*=============================================
+gfinit ldx #0
+gfi1 stz gt1
+ stz gt1+1
+ txa                    ; bits 0-2 -> high byte
+ and #7
+ asl
+ asl
+ sta gt1+1
+ txa                    ; bits 3-5 -> *$80
+ lsr
+ lsr
+ lsr
+ and #7
+ pha
+ lsr
+ clc
+ adc gt1+1
+ sta gt1+1
+ pla
+ and #1
+ beq gfi2
+ lda #$80
+ sta gt1
+gfi2 txa                ; bits 6-7 -> *$28
+ lsr
+ lsr
+ lsr
+ lsr
+ lsr
+ lsr
+ tay
+x01 lda thirds,y
+ clc
+ adc gt1
+ sta gt1
+ lda gt1+1
+ adc #0
+ sta gt1+1
+ lda gt1
+ sta hrlo,x
+ lda gt1+1
+ clc
+ adc #$20               ; page 1 lives at $2000
+ sta hrhi,x
+ inx
+ cpx #192
+ bne gfi1
+* The lo-res screen is the text screen, so its
+* 24 row addresses are the text line addresses:
+*   $400 + (L&7)*$80 + (L>>3)*$28
+* The same three-part shape as the hi-res one,
+* and it reuses the same THIRDS table.
+ ldx #0
+gfi3 txa
+ and #7
+ lsr                    ; bits 1-2 -> high byte
+ sta gt1+1
+ txa
+ and #1                 ; bit 0 -> $80
+ beq gfi4
+ lda #$80
+gfi4 sta gt1
+ txa
+ lsr
+ lsr
+ lsr                    ; L>>3 -> 0, 1 or 2
+ tay
+x02 lda thirds,y
+ clc
+ adc gt1
+ sta gt1
+ lda gt1+1
+ adc #4                 ; text page 1 at $0400
+ sta lorhi,x
+ lda gt1
+ sta lorlo,x
+ inx
+ cpx #24
+ bne gfi3
+ lda #$20
+ sta hpg
+ lda #$7f               ; white
+ sta hcolr
+ stz hx
+ stz hx+1
+ stz hy
+ stz shptr
+ stz shptr+1
+ lda #$0f               ; lo-res starts white
+x03 sta gcol
+ lda #$f0
+x04 sta gcolh
+x05 jsr modraw
+ rts
+thirds dfb $00,$28,$50
+*
+*=============================================
+* HDIV7 - HX divided by seven
+* out: GT3 = byte across the line, GT2 = bit
+*
+* Subtracting the six multiples that matter
+* costs about sixty cycles and saves the
+* 280-byte lookup table we have no room for.
+*=============================================
+hdiv7 lda hx
+ sta gt2
+ lda hx+1
+ sta gt2+1
+ stz gt3
+ ldy #0
+hd7a lda gt2+1
+x06 cmp divhi,y
+ bcc hd7b
+ bne hd7c
+ lda gt2
+x07 cmp divlo,y
+ bcc hd7b
+hd7c sec
+ lda gt2
+x08 sbc divlo,y
+ sta gt2
+ lda gt2+1
+x09 sbc divhi,y
+ sta gt2+1
+ lda gt3
+ clc
+x10 adc divq,y
+ sta gt3
+hd7b iny
+ cpy #6
+ bne hd7a
+ rts
+divlo dfb 140,70,35,21,14,7
+divhi dfb 0,0,0,0,0,0
+divq dfb 20,10,5,3,2,1
+bitmsk dfb $01,$02,$04,$08,$10,$20,$40
+*
+*---- HADDR - address of line HY into HPTR ----
+haddr ldy hy
+ lda hrlo,y
+ sta hptr
+ lda hrhi,y
+ sta hptr+1
+ lda hpg
+ cmp #$20
+ beq hadx
+ lda hptr+1
+ clc
+ adc #$20               ; page 2 is $2000 higher
+ sta hptr+1
+hadx rts
+*
+*---- HONSCR - carry clear if (HX,HY) is on ----
+honscr lda hy
+ cmp #192
+ bcs honno
+ lda hx+1
+ beq honyes
+ cmp #1
+ bne honno
+ lda hx
+ cmp #24                ; 256+24 = 280
+ bcs honno
+honyes clc
+ rts
+honno sec
+ rts
+*
+*=============================================
+* HDOT - plot one point at (HX,HY)
+*=============================================
+hdot equ *
+x140 jsr honscr
+ bcs hdotx
+x11 jsr haddr
+x12 jsr hdiv7
+ ldy gt2
+x13 lda bitmsk,y
+ ora #$80               ; carry the palette bit
+ sta hmask
+ ldy gt3
+ lda (hptr),y
+ sta hold
+hmop eor hcolr          ; patched: EOR draws, LDA xors
+ and hmask
+ eor hold
+ sta (hptr),y
+hdotx rts
+*
+*=============================================
+* MODRAW / MOXOR - one byte tells them apart
+*
+* EOR HCOLR ($45) gives
+*   new = old EOR ((old EOR colour) AND mask)
+* which replaces the pixel.
+* LDA HCOLR ($A5) gives
+*   new = old EOR (colour AND mask)
+* which is XOR: draw twice and the background
+* comes back untouched.
+* Both are two-byte instructions, so only the
+* opcode changes and nothing shifts. The same
+* switch flips the shape plotter, where EOR
+* ($51) becomes ORA ($11).
+*=============================================
+modraw lda #$45
+x14 sta hmop
+ lda #$11
+x15 sta shsop
+ rts
+moxor lda #$a5
+x16 sta hmop
+ lda #$51
+x17 sta shsop
+ rts
+*
+*---- HCLR - blank the current page ----
+hclr lda hpg
+ sta gt1+1
+ stz gt1
+ ldx #32                ; 32 pages is 8K
+hc1 ldy #0
+ lda #0
+hc2 sta (gt1),y
+ iny
+ bne hc2
+ inc gt1+1
+ dex
+ bne hc1
+ rts
+*
+*=============================================
+* SHDRAW - stamp the current shape at (HX,HY)
+*
+* Simoni's method (BYTE, August 1983): the
+* shape is held the way the screen holds it, so
+* plotting is a byte move rather than a walk
+* through a vector list. A row is copied to a
+* small buffer, shifted through the seven-bit
+* boundaries to reach an x that is not a
+* multiple of seven, then merged onto the line.
+*
+* Table: height, width in 7-bit groups (max 7),
+* then height*width bytes. The index is one
+* byte, so a table must stay under 256 bytes.
+*=============================================
+shdraw lda shptr
+ ora shptr+1
+ beq shret              ; no shape selected
+x18 jsr hdiv7           ; GT3 = byte, GT2 = shift
+ ldy #0
+ lda (shptr),y
+ sta shght
+ iny
+ lda (shptr),y
+ sta shwid
+ iny
+ sty shidx
+shrow lda hy
+ cmp #192
+ bcs shskip
+* copy one row into the buffer, back to front
+ ldx shwid
+ ldy shidx
+shcp lda (shptr),y
+x19 sta shbuf,x
+ iny
+ dex
+ bne shcp
+ sty shidx
+x20 stz shbuf           ; the byte bits spill into
+* shift the whole row left GT2 times
+ ldy gt2
+ beq shpl
+shs1 clc
+ ldx shwid
+ php                    ; keep the stack even
+shs2 plp                ; carry from the last byte
+x21 lda shbuf,x
+ rol
+ rol                    ; bit 6 falls into carry
+ php                    ; save it for the next byte
+ lsr                    ; back to seven bits
+x22 sta shbuf,x
+ dex
+ cpx #$ff
+ bne shs2
+ plp
+ dey
+ bne shs1
+* merge the row onto the screen
+shpl equ *
+x141 jsr haddr
+ ldy gt3
+ ldx shwid
+shp1 equ *
+x142 lda shbuf,x
+shsop eor (hptr),y      ; patched: EOR or ORA
+ sta (hptr),y
+ iny
+ dex
+ cpx #$ff
+ bne shp1
+ bra shnxt
+shskip clc              ; off screen: skip the row
+ lda shidx
+ adc shwid
+ sta shidx
+shnxt inc hy
+ dec shght
+ bne shrow
+shret rts
+shbuf ds 8
+*
+*=============================================
+* THE DICTIONARY
+* GFFIRST's link is patched by MODLD, so it is
+* not in the fixup list. Every other link and
+* every code field is.
+*=============================================
+*
+*=============================================
+* HGR ( n -- ) a hi-res screen, cleared
+*
+* 1 HGR and 2 HGR pick the page: $2000 or
+* $4000. Page 1 comes up mixed, so the prompt
+* stays visible along the bottom. PAGE 2 COMES
+* UP FULL SCREEN AND CANNOT BE MIXED.
+*
+* There is one page select for the whole
+* display, not one for graphics and another
+* for text. So the four text lines at the foot
+* of a mixed screen are read from text page 2
+* whenever the graphics are read from hi-res
+* page 2 - and text page 2 is $0800, which is
+* where this system lives. A mixed page 2 puts
+* the kernel on the screen as characters.
+*
+* This is exactly why Applesoft's HGR was
+* mixed and its HGR2 full screen. A BASIC
+* program started at $0801 and would have been
+* displayed as garbage for the same reason. It
+* was not an arbitrary pairing; it was the
+* hardware.
+*=============================================
+gffirst da 0            ; MODLD patches this
+ dfb 3
+ asc "HGR"
+x23 da w_hgr
+w_hgr jsr kpop
+ tya
+ cmp #2
+ beq w_hgr2
+ lda #$20
+ sta hpg
+x24 jsr hclr
+ lda #1
+x25 sta gdpg
+ sta txtclr
+ sta mixset             ; page 1 may be mixed
+ sta hires
+ sta lowscr
+ jmp knext
+w_hgr2 lda #$40
+ sta hpg
+x26 jsr hclr
+ lda #2
+x27 sta gdpg
+ sta txtclr
+ sta mixclr             ; page 2 NEVER mixed
+ sta hires              ; hi-res BEFORE page 2
+ sta hiscr
+ jmp knext
+*
+*---- TEXT ( -- ) back to the text screen ----
+* Page 1 first, THEN text. The kernel lives at
+* $0800, which is where text page 2 used to
+* be, so pointing the display at page 2 in
+* text mode would put the kernel on the screen
+* as a field of random characters.
+x28 da gffirst
+ dfb 4
+ asc "TEXT"
+x29 da w_text
+w_text lda #1
+x30 sta gdpg
+ sta lowscr
+ sta txtset
+ jmp knext
+h_text equ x28
+*
+*---- HCLEAR ( -- ) ----
+x31 da h_text
+ dfb 6
+ asc "HCLEAR"
+x32 da w_hclr
+w_hclr equ *
+x33 jsr hclr
+ jmp knext
+h_hclr equ x31
+*
+*---- HCOLOR ( n -- ) 0 to 7 ----
+x34 da h_hclr
+ dfb 6
+ asc "HCOLOR"
+x35 da w_hcol
+w_hcol jsr kpop
+ tya
+ and #7
+ tay
+x36 lda coltab,y
+ sta hcolr
+ jmp knext
+coltab dfb $00,$2a,$55,$7f,$80,$aa,$d5,$ff
+h_hcol equ x34
+*
+*---- HPLOT ( x y -- ) plot and remember ----
+x37 da h_hcol
+ dfb 5
+ asc "HPLOT"
+x38 da w_hplt
+w_hplt jsr kpop
+ sty hy
+ jsr kpop
+ sty hx
+ sta hx+1
+x39 jsr hdot
+ jmp knext
+h_hplt equ x37
+*
+*=============================================
+* HLINE ( x2 y2 -- )
+* Draws from wherever HPLOT left us to (x2,y2),
+* which then becomes the current point. Because
+* the start is remembered the word needs only
+* one endpoint - the way Applesoft's HPLOT TO
+* works, and it halves the argument juggling.
+* Bresenham, with x in sixteen bits.
+*=============================================
+x40 da h_hplt
+ dfb 5
+ asc "HLINE"
+x41 da w_hlin
+w_hlin jsr kpop
+ sty hy2
+ jsr kpop
+ sty hx2
+ sta hx2+1
+ sec                    ; dx and the x step
+ lda hx2
+ sbc hx
+ sta hdx
+ lda hx2+1
+ sbc hx+1
+ sta hdx+1
+ bpl hlpx
+ sec
+ lda #0
+ sbc hdx
+ sta hdx
+ lda #0
+ sbc hdx+1
+ sta hdx+1
+ lda #$ff
+ sta hsx
+ bra hlpy
+hlpx lda #1
+ sta hsx
+hlpy sec                ; dy and the y step
+ lda hy2
+ sbc hy
+ bcs hlpy1
+ eor #$ff
+ inc
+ sta hdy
+ lda #$ff
+ sta hsy
+ bra hlerr
+hlpy1 sta hdy
+ lda #1
+ sta hsy
+hlerr sec               ; err = dx - dy
+ lda hdx
+ sbc hdy
+ sta herr
+ lda hdx+1
+ sbc #0
+ sta herr+1
+hlloop equ *
+x42 jsr hdot
+ lda hx                 ; have we arrived
+ cmp hx2
+ bne hlgo
+ lda hx+1
+ cmp hx2+1
+ bne hlgo
+ lda hy
+ cmp hy2
+ beq hldone
+hlgo lda herr           ; e2 = err * 2
+ asl
+ sta he2
+ lda herr+1
+ rol
+ sta he2+1
+ clc                    ; if e2 > -dy step x
+ lda he2
+ adc hdy
+ sta gt1
+ lda he2+1
+ adc #0
+ sta gt1+1
+ bmi hlny
+ ora gt1
+ beq hlny
+ sec
+ lda herr
+ sbc hdy
+ sta herr
+ lda herr+1
+ sbc #0
+ sta herr+1
+ lda hsx
+ bmi hlxdn
+ inc hx
+ bne hlny
+ inc hx+1
+ bra hlny
+hlxdn lda hx
+ bne hlxd1
+ dec hx+1
+hlxd1 dec hx
+hlny sec                ; if e2 < dx step y
+ lda he2
+ sbc hdx
+ lda he2+1
+ sbc hdx+1
+ bvc hlsgn
+ eor #$80
+hlsgn bpl hlnx
+ clc
+ lda herr
+ adc hdx
+ sta herr
+ lda herr+1
+ adc hdx+1
+ sta herr+1
+ lda hsy
+ bmi hlydn
+ inc hy
+ bra hlnx
+hlydn dec hy
+hlnx equ *
+x43 jmp hlloop
+hldone jmp knext
+h_hlin equ x40
+*
+*---- DRAWMODE ( n -- ) 0 draw, 1 xor ----
+x44 da h_hlin
+ dfb 8
+ asc "DRAWMODE"
+x45 da w_dmod
+w_dmod jsr kpop
+ tya
+ beq w_dm0
+x46 jsr moxor
+ jmp knext
+w_dm0 equ *
+x47 jsr modraw
+ jmp knext
+h_dmod equ x44
+*
+*---- HPAGE ( n -- ) draw on page 1 or 2 ----
+x48 da h_dmod
+ dfb 5
+ asc "HPAGE"
+x49 da w_hpag
+w_hpag jsr kpop
+ tya
+ cmp #2
+ beq w_hp2
+ lda #$20
+ sta hpg
+ jmp knext
+w_hp2 lda #$40
+ sta hpg
+ jmp knext
+h_hpag equ x48
+*
+*---- HSCRN ( x y -- f ) is that pixel lit ----
+x50 da h_hpag
+ dfb 5
+ asc "HSCRN"
+x51 da w_hscr
+w_hscr jsr kpop
+ sty hy
+ jsr kpop
+ sty hx
+ sta hx+1
+x143 jsr honscr
+ bcs w_hs0
+x52 jsr haddr
+x53 jsr hdiv7
+ ldy gt2
+x54 lda bitmsk,y
+ sta hmask
+ ldy gt3
+ lda (hptr),y
+ and hmask
+ beq w_hs0
+ lda #0
+ ldy #1
+ jsr kpush
+ jmp knext
+w_hs0 lda #0
+ tay
+ jsr kpush
+ jmp knext
+h_hscr equ x50
+*
+*=============================================
+* SHAPE ( n -- ) choose the nth shape
+*
+* No index table is needed. Every shape begins
+* with its height and width, so shape n is
+* found by stepping over the n before it, each
+* 2 + height*width bytes long. A shape file is
+* therefore nothing but tables laid end to end
+* - concatenate what the editor gives you and
+* it works.
+*
+* The file itself arrives through LOAD, which
+* recognises it by its name and records where
+* it put it in the communication block. So
+* there is nothing to tell SHAPE: it looks the
+* address up. Asking for a shape the file does
+* not contain gives shape 0 rather than a walk
+* off the end of it, and asking with no file
+* loaded says so.
+*=============================================
+x55 da h_hscr
+ dfb 5
+ asc "SHAPE"
+x56 da w_shap
+w_shap jsr kpop
+ sty shcnt
+ lda shpadr
+ sta shptr
+ lda shpadr+1
+ sta shptr+1
+ ora shptr              ; both zero: no file
+ beq shsno
+shsl lda shcnt
+ beq shsx
+ dec shcnt
+ ldy #0
+ lda (shptr),y          ; height
+ sta shght
+ iny
+ lda (shptr),y          ; width
+ sta shwid
+ lda #2                 ; size = 2 + height*width
+ sta shsz
+ stz shsz+1
+ ldx shwid
+ beq shsa2
+shsa1 clc
+ lda shsz
+ adc shght
+ sta shsz
+ bcc shsa0
+ inc shsz+1
+shsa0 dex
+ bne shsa1
+shsa2 clc
+ lda shptr
+ adc shsz
+ sta shptr
+ lda shptr+1
+ adc shsz+1
+ sta shptr+1
+ lda shptr+1            ; still inside the file?
+ cmp shpend+1
+ bcc shsl
+ bne shsrst
+ lda shptr
+ cmp shpend
+ bcc shsl
+shsrst lda shpadr       ; past the end: shape 0
+ sta shptr
+ lda shpadr+1
+ sta shptr+1
+shsx jmp knext
+shsno lda #$3f ;"?"
+ jsr kemit
+ stz shptr
+ stz shptr+1
+ jmp knext
+h_shap equ x55
+*
+*---- DRAW ( x y -- ) stamp it there ----
+* A shape pointer of zero means none has been
+* chosen, so the arguments are dropped and
+* nothing is drawn - better than stamping
+* whatever happens to sit at $0000.
+x57 da h_shap
+ dfb 4
+ asc "DRAW"
+x58 da w_draw
+w_draw jsr kpop
+ sty hy
+ jsr kpop
+ sty hx
+ sta hx+1
+ lda shptr
+ ora shptr+1
+ beq w_drwx
+x59 jsr shdraw
+w_drwx jmp knext
+h_draw equ x57
+*
+*---- PDL ( n -- 0..255 ) read a paddle ----
+x60 da h_draw
+ dfb 3
+ asc "PDL"
+x61 da w_pdl
+w_pdl jsr kpop
+ tya
+ and #3
+ tax
+ jsr pread              ; returns the count in Y
+ lda #0
+ jsr kpush
+ jmp knext
+h_pdl equ x60
+*
+*---- BTN ( n -- flag ) read a button ----
+* Read outright rather than indexed: an
+* absolute,X read of a soft switch can touch
+* the neighbouring one on the way past.
+x62 da h_pdl
+ dfb 3
+ asc "BTN"
+x63 da w_btn
+w_btn jsr kpop
+ tya
+ cmp #1
+ beq w_bt1
+ cmp #2
+ beq w_bt2
+ lda btn0
+ bra w_btt
+w_bt1 lda btn1
+ bra w_btt
+w_bt2 lda btn2
+w_btt bmi w_btrue
+ lda #0
+ tay
+ jsr kpush
+ jmp knext
+w_btrue lda #0
+ ldy #1
+ jsr kpush
+ jmp knext
+h_btn equ x62
+*
+*=============================================
+* THE LO-RES SCREEN
+*
+* 40 across by 48 down, in the same memory the
+* text screen uses. Each byte holds two blocks
+* stacked one above the other: the low nibble
+* is the even row, the high nibble the odd one.
+* So a row address serves two rows, and the
+* table only needs 24 entries.
+*
+* Row by row through the table, never a bulk
+* fill: the 80-column firmware keeps state in
+* the holes between the rows, and writing over
+* them jams the cursor.
+*=============================================
+*
+*---- lorow - point GT1 at row A's line ----
+* out: A = 0 for the low nibble, 1 for the high
+lorow pha
+ lsr                    ; two rows to a line
+ tax
+ lda lorlo,x
+ sta gt1
+ lda lorhi,x
+ sta gt1+1
+ pla
+ and #1
+ rts
+*
+*---- loput - colour the block at column Y ----
+* Y is preserved, so a row can be walked with
+* nothing but INY.
+loput lda (gt1),y
+x64 ldx ghalf
+ bne lopu1
+ and #$f0               ; keep the odd row
+x65 ora gcol
+ bra lopu2
+lopu1 and #$0f          ; keep the even row
+x66 ora gcolh
+lopu2 sta (gt1),y
+ rts
+*
+*---- GR ( -- ) the lo-res screen, cleared ----
+x67 da h_btn
+ dfb 2
+ asc "GR"
+x68 da w_gr
+* Forty columns first. The lo-res screen IS
+* the text screen, so with the 80-column
+* firmware running, half of every row would be
+* coming out of auxiliary memory and the
+* picture would be shredded. Ctrl-Q is the
+* same code TEXT40 uses, and it does no harm
+* if 80 columns were never turned on - GRCLR
+* wipes the screen straight afterwards.
+w_gr lda #$11 ;ctrl-Q
+ jsr kemit
+x69 jsr grclr
+ lda #1                 ; there is no lo-res page 2
+x70 sta gdpg
+ sta lowscr             ; page 1 FIRST - coming from
+ sta txtclr             ; page 2, anything else would
+ sta mixset             ; show $0800 as lo-res first
+ sta lores
+ jmp knext
+h_gr equ x67
+*
+*---- grclr - blank all 24 lines ----
+grclr ldx #0
+grc1 lda lorlo,x
+ sta gt1
+ lda lorhi,x
+ sta gt1+1
+ lda #0
+ ldy #39
+grc2 sta (gt1),y
+ dey
+ bpl grc2
+ inx
+ cpx #24
+ bne grc1
+ rts
+*
+*---- COLOR ( n -- ) 0 to 15 ----
+* Kept twice over, once in each nibble, so
+* plotting never has to shift anything.
+x71 da h_gr
+ dfb 5
+ asc "COLOR"
+x72 da w_colr
+w_colr jsr kpop
+ tya
+ and #$0f
+x73 sta gcol
+ asl
+ asl
+ asl
+ asl
+x74 sta gcolh
+ jmp knext
+h_colr equ x71
+*
+*---- PLOT ( x y -- ) ----
+x75 da h_colr
+ dfb 4
+ asc "PLOT"
+x76 da w_plot
+w_plot jsr kpop         ; y
+x77 sty gy
+ jsr kpop               ; x
+x78 sty gx1
+x79 lda gy
+ cmp #48
+ bcs plotx
+x80 lda gx1
+ cmp #40
+ bcs plotx
+x81 lda gy
+x82 jsr lorow
+x83 sta ghalf
+x84 ldy gx1
+x85 jsr loput
+plotx jmp knext
+h_plot equ x75
+*
+*---- HLIN ( x1 x2 y -- ) ----
+x86 da h_plot
+ dfb 4
+ asc "HLIN"
+x87 da w_lhln
+w_lhln jsr kpop         ; y
+x88 sty gy
+ jsr kpop               ; x2
+x89 sty gx2
+ jsr kpop               ; x1
+x90 sty gx1
+x91 lda gy
+ cmp #48
+ bcs lhlx
+x92 lda gx1             ; put the ends in order
+x93 cmp gx2
+ bcc lhl1
+ beq lhl1
+x94 ldy gx2
+x95 sta gx2
+x96 sty gx1
+lhl1 equ *
+x97 lda gy
+x98 jsr lorow
+x99 sta ghalf
+x100 ldy gx1
+lhl2 cpy #40
+ bcs lhlx               ; ran off the right edge
+x101 jsr loput
+x102 cpy gx2
+ beq lhlx
+ iny
+ bra lhl2
+lhlx jmp knext
+h_lhln equ x86
+*
+*---- VLIN ( y1 y2 x -- ) ----
+* The row address has to be worked out again
+* for every row, which is why a vertical line
+* costs more than a horizontal one.
+x103 da h_lhln
+ dfb 4
+ asc "VLIN"
+x104 da w_vlin
+w_vlin jsr kpop         ; x
+x105 sty gx1
+ jsr kpop               ; y2
+x106 sty gx2
+ jsr kpop               ; y1
+x107 sty gy
+x108 lda gx1
+ cmp #40
+ bcs vlnx
+x109 lda gy              ; put the ends in order
+x110 cmp gx2
+ bcc vln1
+ beq vln1
+x111 ldy gx2
+x112 sta gx2
+x113 sty gy
+vln1 equ *
+x114 lda gy
+ cmp #48
+ bcs vlnx
+x115 jsr lorow
+x116 sta ghalf
+x117 ldy gx1
+x118 jsr loput
+x119 lda gy
+x120 cmp gx2
+ beq vlnx
+x121 inc gy
+ bra vln1
+vlnx jmp knext
+h_vlin equ x103
+*
+*---- SCRN ( x y -- c ) read a block ----
+x122 da h_vlin
+ dfb 4
+ asc "SCRN"
+x123 da w_scrn
+w_scrn jsr kpop         ; y
+x124 sty gy
+ jsr kpop               ; x
+x125 sty gx1
+x126 lda gy
+ cmp #48
+ bcs scrn0
+x127 lda gx1
+ cmp #40
+ bcs scrn0
+x128 lda gy
+x129 jsr lorow
+x130 sta ghalf
+x131 ldy gx1
+ lda (gt1),y
+x132 ldx ghalf
+ beq scrn1
+ lsr
+ lsr
+ lsr
+ lsr
+scrn1 and #$0f
+ tay
+ lda #0
+ jsr kpush
+ jmp knext
+scrn0 lda #0
+ tay
+ jsr kpush
+ jmp knext
+h_scrn equ x122
+*
+*---- MIXED ( n -- ) ----
+* 1 keeps four lines of text at the foot of
+* the graphics screen, 0 gives the whole
+* screen over to the picture.
+x133 da h_scrn
+ dfb 5
+ asc "MIXED"
+x134 da w_mixd
+w_mixd jsr kpop
+ tya
+ beq w_mix0
+x135 lda gdpg           ; asking for text at the foot
+ cmp #2
+ beq w_mixno           ; of page 2 - see HGR
+ sta mixset
+ jmp knext
+w_mix0 sta mixclr
+ jmp knext
+w_mixno lda #$3f ;"?"
+ jsr kemit
+ jmp knext
+h_mixd equ x133
+*
+*=============================================
+* SHOW ( n -- ) display a page without
+* clearing it
+*
+* HPAGE says where to DRAW, SHOW says what to
+* LOOK AT, and the two together are what makes
+* animation without flicker: build the next
+* picture on the page nobody is watching, then
+* SHOW it. HGR would clear the page first,
+* which is the one thing that must not happen.
+*
+* Showing page 2 turns the mixing off, for the
+* same reason HGR does.
+*=============================================
+x136 da h_mixd
+ dfb 4
+ asc "SHOW"
+x137 da w_show
+w_show jsr kpop
+ tya
+ cmp #2
+ beq w_shw2
+ lda #1
+x138 sta gdpg
+ sta hires
+ sta lowscr
+ jmp knext
+w_shw2 lda #2
+x139 sta gdpg
+ sta mixclr             ; before, never after
+ sta hires
+ sta hiscr
+ jmp knext
+h_show equ x136
+*
+*---- lo-res working storage ----
+* Past $100, where a plain LDA or STA cannot
+* be mistaken for a zero page reference.
+gcol dfb $0f            ; colour, low nibble
+gcolh dfb $f0           ; the same, high nibble
+ghalf dfb 0             ; which half of the byte
+gx1 dfb 0
+gx2 dfb 0
+gy dfb 0
+gdpg dfb 1              ; the page being DISPLAYED
+*
+gflast equ h_show
+gfend equ *
+*
+*=============================================
+* THE FIXUP LIST
+*
+* Every place inside the image holding an
+* address. Instruction operands are one byte
+* past the opcode; DA fields are the address
+* itself. The count below must match - this
+* assembler drops the division in an expression
+* like (relend-relst)/2, so it is stated
+* outright and must be kept in step by hand.
+*=============================================
+relst equ *
+ da x01+1              ; lda thirds,y
+ da x02+1              ; lda thirds,y
+ da x03+1              ; sta gcol
+ da x04+1              ; sta gcolh
+ da x05+1              ; jsr modraw
+ da x06+1              ; cmp divhi,y
+ da x07+1              ; cmp divlo,y
+ da x08+1              ; sbc divlo,y
+ da x09+1              ; sbc divhi,y
+ da x10+1              ; adc divq,y
+ da x11+1              ; jsr haddr
+ da x12+1              ; jsr hdiv7
+ da x13+1              ; lda bitmsk,y
+ da x14+1              ; sta hmop
+ da x15+1              ; sta shsop
+ da x16+1              ; sta hmop
+ da x17+1              ; sta shsop
+ da x18+1              ; jsr hdiv7
+ da x19+1              ; sta shbuf,x
+ da x20+1              ; stz shbuf
+ da x21+1              ; lda shbuf,x
+ da x22+1              ; sta shbuf,x
+ da x23                ; da w_hgr
+ da x24+1              ; jsr hclr
+ da x25+1              ; sta gdpg
+ da x26+1              ; jsr hclr
+ da x27+1              ; sta gdpg
+ da x28                ; da gffirst
+ da x29                ; da w_text
+ da x30+1              ; sta gdpg
+ da x31                ; da h_text
+ da x32                ; da w_hclr
+ da x33+1              ; jsr hclr
+ da x34                ; da h_hclr
+ da x35                ; da w_hcol
+ da x36+1              ; lda coltab,y
+ da x37                ; da h_hcol
+ da x38                ; da w_hplt
+ da x39+1              ; jsr hdot
+ da x40                ; da h_hplt
+ da x41                ; da w_hlin
+ da x42+1              ; jsr hdot
+ da x43+1              ; jmp hlloop
+ da x44                ; da h_hlin
+ da x45                ; da w_dmod
+ da x46+1              ; jsr moxor
+ da x47+1              ; jsr modraw
+ da x48                ; da h_dmod
+ da x49                ; da w_hpag
+ da x50                ; da h_hpag
+ da x51                ; da w_hscr
+ da x52+1              ; jsr haddr
+ da x53+1              ; jsr hdiv7
+ da x54+1              ; lda bitmsk,y
+ da x55                ; da h_hscr
+ da x56                ; da w_shap
+ da x57                ; da h_shap
+ da x58                ; da w_draw
+ da x59+1              ; jsr shdraw
+ da x60                ; da h_draw
+ da x61                ; da w_pdl
+ da x62                ; da h_pdl
+ da x63                ; da w_btn
+ da x64+1              ; ldx ghalf
+ da x65+1              ; ora gcol
+ da x66+1              ; ora gcolh
+ da x67                ; da h_btn
+ da x68                ; da w_gr
+ da x69+1              ; jsr grclr
+ da x70+1              ; sta gdpg
+ da x71                ; da h_gr
+ da x72                ; da w_colr
+ da x73+1              ; sta gcol
+ da x74+1              ; sta gcolh
+ da x75                ; da h_colr
+ da x76                ; da w_plot
+ da x77+1              ; sty gy
+ da x78+1              ; sty gx1
+ da x79+1              ; lda gy
+ da x80+1              ; lda gx1
+ da x81+1              ; lda gy
+ da x82+1              ; jsr lorow
+ da x83+1              ; sta ghalf
+ da x84+1              ; ldy gx1
+ da x85+1              ; jsr loput
+ da x86                ; da h_plot
+ da x87                ; da w_lhln
+ da x88+1              ; sty gy
+ da x89+1              ; sty gx2
+ da x90+1              ; sty gx1
+ da x91+1              ; lda gy
+ da x92+1              ; lda gx1
+ da x93+1              ; cmp gx2
+ da x94+1              ; ldy gx2
+ da x95+1              ; sta gx2
+ da x96+1              ; sty gx1
+ da x97+1              ; lda gy
+ da x98+1              ; jsr lorow
+ da x99+1              ; sta ghalf
+ da x100+1             ; ldy gx1
+ da x101+1             ; jsr loput
+ da x102+1             ; cpy gx2
+ da x103               ; da h_lhln
+ da x104               ; da w_vlin
+ da x105+1             ; sty gx1
+ da x106+1             ; sty gx2
+ da x107+1             ; sty gy
+ da x108+1             ; lda gx1
+ da x109+1             ; lda gy
+ da x110+1             ; cmp gx2
+ da x111+1             ; ldy gx2
+ da x112+1             ; sta gx2
+ da x113+1             ; sty gy
+ da x114+1             ; lda gy
+ da x115+1             ; jsr lorow
+ da x116+1             ; sta ghalf
+ da x117+1             ; ldy gx1
+ da x118+1             ; jsr loput
+ da x119+1             ; lda gy
+ da x120+1             ; cmp gx2
+ da x121+1             ; inc gy
+ da x122               ; da h_vlin
+ da x123               ; da w_scrn
+ da x124+1             ; sty gy
+ da x125+1             ; sty gx1
+ da x126+1             ; lda gy
+ da x127+1             ; lda gx1
+ da x128+1             ; lda gy
+ da x129+1             ; jsr lorow
+ da x130+1             ; sta ghalf
+ da x131+1             ; ldy gx1
+ da x132+1             ; ldx ghalf
+ da x133               ; da h_scrn
+ da x134               ; da w_mixd
+ da x135+1             ; lda gdpg
+ da x136               ; da h_mixd
+ da x137               ; da w_show
+ da x138+1             ; sta gdpg
+ da x139+1             ; sta gdpg
+* --- found missing 2026-11-08: these four were
+* --- never listed, so they kept their ORG-0
+* --- addresses and jumped into the stack page
+ da x140+1             ; jsr honscr
+ da x141+1             ; jsr haddr
+ da x142+1             ; lda shbuf,x
+ da x143+1             ; jsr honscr
+relend equ *
+* NREL, the count of the DA lines above, is
+* declared at the top of this file, where the
+* module header can read it.  Keep the two in
+* step by hand.

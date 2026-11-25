@@ -1,0 +1,56 @@
+*=============================================
+* SHAPES.SHP - a block shape file for
+* FORTH.GFX
+*
+* Assemble this and save the object as
+* SHAPES.SHP. The extension is what matters -
+* the load address and file type are ignored:
+*
+*   1 GREN
+*   LOAD SHAPES.SHP
+*   1 HGR
+*   2 SHAPE 140 96 DRAW
+*
+* A block shape is stored the way the screen
+* stores it, so drawing one is a byte move
+* rather than a walk along a list of vectors.
+*
+*   byte 0    height, in scan lines
+*   byte 1    width, in groups of seven bits
+*   then      height*width bytes, row by row
+*
+* Width counts SEVEN-BIT groups because that
+* is how many pixels fit in a hi-res byte, and
+* it may not exceed 7. Within each group the
+* bits run in reverse, low bit leftmost - the
+* shapes here are all symmetrical, so it makes
+* no difference to them, but it will to yours.
+*
+* There is no index and no count. Shapes are
+* laid end to end, and SHAPE finds the nth by
+* stepping over the ones before it, each of
+* them 2 + height*width bytes long. To add a
+* shape, append it.
+*=============================================
+ org $2000
+*
+*---- shape 0: a solid seven by eight block ----
+ dfb 8,1
+ hex 7f7f7f7f7f7f7f7f
+*
+*---- shape 1: a fourteen by six bar ----
+ dfb 6,2
+ hex 7f7f7f7f7f7f
+ hex 7f7f7f7f7f7f
+*
+*---- shape 2: a diamond ----
+ dfb 7,1
+ hex 081c3e7f3e1c08
+*
+*---- shape 3: a hollow box ----
+ dfb 8,1
+ hex 7f4141414141417f
+*
+*---- shape 4: one dot, for aiming with ----
+ dfb 1,1
+ hex 08

@@ -1,0 +1,3330 @@
+* FORTH.SYSTEM - 16-bit FORTH, Apple //e
+* ProDOS 8 system program.
+* TEST038: TEST037 plus the beta fixes - three
+* out-of-range branches and DIRP moved to zero
+* page, where indirect addressing needs it.
+ xc
+* --- ROM / ProDOS ---
+cout equ $fded
+crout equ $fd8e
+home equ $fc58
+rdkey equ $fd0c
+rndl equ $4e            ; the monitor counts here
+prbyte equ $fdda
+move equ $fe2c
+prompt equ $33
+mli equ $bf00
+devnum equ $bf30
+a1l equ $3c
+a2l equ $3e
+a4l equ $42
+setalt equ $c00f
+* --- memory map ---
+load equ $2000
+run equ $0800           ; text page 2 given up
+stklo equ $8000
+stkhi equ $8100
+srclog equ $6000
+logmax equ $7700
+logend equ $7800
+catbuf equ $7800
+iobuf equ $7c00
+path equ $8200
+onbuf equ $8250 ; clear of path's 66 bytes
+numbuf equ $8280
+loopstk equ $82c0
+dict equ $8300
+inbuf equ $0200
+* --- zero page (all < $100) ---
+sptr equ $e0
+base equ $e5
+ip equ $eb
+w equ $ed
+tibp equ $06
+tlen equ $08
+curr equ $0a
+nptr equ $0c
+xcfa equ $0e
+t1 equ $10
+t2 equ $12
+tmp equ $14
+cp equ $16
+logp equ $18
+nacc equ $1a
+nsign equ $1c
+ndigit equ $1d
+lcnt equ $1e
+linlen equ $1f
+srcp equ $a4
+srcend equ $a6
+dpsave equ $a8
+nolog equ $aa
+nrem equ $ab
+ndcnt equ $ac
+catp equ $ad
+catn equ $af
+dacc equ $b0
+dtmp equ $b4
+dsgn equ $b8
+msgn equ $b9
+t3 equ $ba
+lsp equ $bc
+bootf equ $bd
+dpboot equ $f7          ; dp after the boot load
+lstboot equ $f9         ; lst after the boot load
+envflg equ $fb          ; which modules are loaded
+forceg equ $fc          ; this line declares something
+* module loader, used only while loading.
+* A module may reuse these once it is running.
+mbase equ $be           ; where the image landed
+mlast equ $c0           ; offset of its newest word
+mfirst equ $c2          ; offset of its oldest word
+mlen equ $c4            ; bytes in the image
+minit equ $c6           ; offset of its init routine
+mnrel equ $c8           ; relocation entries left
+mrel equ $ca            ; walks the relocation list
+* DIR writes names through (dirp),y, which needs
+* a zero-page pointer. It borrows the module
+* loader's first pair: DIR can never run while
+* MODLD is running, the same argument that lets
+* PLAY borrow it in FORTH.SND.
+dirp equ $be            ; borrows MBASE, above
+dp equ $f0
+lst equ $f2
+state equ $f4
+cdef equ $f5
+* --- BOOT at $2000, copy kernel to $0800 ---
+ org load
+boot cld
+ ldx #$ff
+ txs
+ lda #<kstart
+ sta a1l
+ lda #>kstart
+ sta a1l+1
+ lda #<klast
+ sta a2l
+ lda #>klast
+ sta a2l+1
+ lda #<run
+ sta a4l
+ lda #>run
+ sta a4l+1
+ ldy #0
+ jsr move
+ jmp cold
+kstart equ *
+* --- kernel runs at $0800 ---
+ org run
+*=============================================
+* MODULE JUMP TABLE
+* Loadable modules reach the kernel through
+* these fixed slots instead of hard-coding
+* addresses that move every time the kernel is
+* reassembled. FROZEN: append new entries at
+* the end, never reorder or insert.
+*=============================================
+ jmp cold               ; +0  entry point
+ jmp push               ; +3  A=hi Y=lo -> stack
+ jmp pop                ; +6  stack -> A=hi Y=lo
+ jmp peek               ; +9  top, left in place
+ jmp next               ; +12 the inner interpreter
+ jmp docol              ; +15 enter a colon word
+ jmp emitc              ; +18 print the char in A
+ jmp comma              ; +21 append T1 to the dict
+ jmp find               ; +24 look up a token
+ jmp word               ; +27 next token
+ jmp number             ; +30 parse a literal
+ da cf_exit             ; +33 an ADDRESS, not a jump
+ da cf_lit              ; +35 likewise
+*=============================================
+* MODULE COMMUNICATION BLOCK
+* Not jumps but variables, at fixed addresses
+* for the same reason. LOAD fills them in when
+* it recognises a data file by its extension;
+* the modules read them to find their data.
+* Both are zero when nothing is loaded.
+*=============================================
+shpadr da 0             ; +37 the block shape file
+shpend da 0             ; +39 first byte past it
+sndadr da 0             ; +41 the tune file
+sndend da 0             ; +43 first byte past it
+*---- emitc - print A, high bit forced ----
+emitc ora #$80
+ jmp cout
+*=============================================
+* Cold start
+cold cld
+ sta setalt
+ jsr home
+ jsr initz
+ ldx #$ff
+ txs
+ ldy #0
+banlp lda banner,y
+ beq bootgo
+ jsr cout
+ iny
+ bne banlp
+banner asc "FORTH V0.1"
+ hex 8d8d00
+* load FORTH.WORDS if it is on the disk.
+* Say so plainly if it is not, rather than
+* leaving the user to wonder why half the
+* vocabulary is missing.
+bootgo jsr autopfx
+ lda #<wname
+ ldy #>wname
+ jsr setnam
+ jsr bootld
+ bcc bootgo1
+ ldy #0
+bgmsg lda mnowd,y
+ beq bgm2
+ jsr cout
+ iny
+ bne bgmsg
+bgm2 jmp warm
+bootgo1 jmp nxtwd
+mnowd asc "NO FORTH.WORDS"
+ hex 8d00
+* autopfx - set the prefix to the disk we came
+* from, so FORTH.WORDS is found without the
+* user having to type PREFIX first.
+* DEVNUM ($BF30) holds the unit we were loaded
+* from; ON_LINE turns that into a volume name.
+* An existing prefix is left alone.
+autopfx jsr getpfx
+ bcs apf1 ; unreadable: set one anyway
+ lda path
+ bne apfx ; already set, leave it be
+apf1 lda devnum
+ sta onparm+1
+ jsr mli
+ dfb $c5 ; ON_LINE
+ da onparm
+ bcs apfx
+ lda onbuf
+ and #$0f ; low nibble is the length
+ beq apfx ; zero means an error code
+ sta tmp
+ clc
+ adc #2 ; room for both slashes
+ sta path
+ lda #$2f ;"/"
+ sta path+1
+ ldy #0
+apf2 lda onbuf+1,y
+ sta path+2,y
+ iny
+ cpy tmp
+ bne apf2
+ ldx tmp
+ lda #$2f ;"/"
+ sta path+2,x
+ lda #<path
+ sta spparm+1
+ lda #>path
+ sta spparm+2
+ jsr mli
+ dfb $c6 ; SET_PREFIX
+ da spparm
+apfx rts
+*=============================================
+* MODLD - load a relocatable module
+*
+* A module is assembled at ORG 0, so it can be
+* dropped anywhere. Its file begins with a ten
+* byte header of OFFSETS, then the code image,
+* then a list of places inside that image which
+* hold an address and therefore need the load
+* address added to them.
+*
+*   +0  da m_last    newest word in the module
+*   +2  da m_first   oldest word, link patched
+*   +4  da m_len     bytes in the image
+*   +6  da m_init    routine to call once
+*   +8  da m_nrel    how many fixups follow
+*   +10 the image
+*       then m_nrel two-byte offsets
+*
+* Only addresses INSIDE the module need fixing.
+* References to the kernel go through the jump
+* table, and references to fixed hardware are
+* fixed. Branches are relative and never move.
+*
+* Exit: carry set if the file would not load.
+*=============================================
+modld jsr setpth
+ jsr openf
+ bcc mlopok
+ sec                    ; no such file
+ rts
+mlopok lda refnum
+ sta rdparm+1
+ lda dp
+ sta rdparm+2
+ lda dp+1
+ sta rdparm+3
+ sec                    ; read at most what fits
+ lda #$00
+ sbc dp
+ sta rdparm+4
+ lda #$bf
+ sbc dp+1
+ sta rdparm+5
+ jsr mli
+ dfb $ca
+ da rdparm
+ bcc mlrok
+ cmp #$4c
+ beq mlrok
+ pha
+ jsr closef
+ pla
+ sec
+ rts
+mlrok jsr closef
+* Everything in a module is an offset from the
+* load address, the ten byte header included.
+* One base for the header, the fixups and the
+* addresses being fixed - mixing two was an
+* off-by-ten that relocated every internal
+* address ten bytes too high.
+ lda dp
+ sta mbase
+ lda dp+1
+ sta mbase+1
+* copy the header of offsets out
+ ldy #0
+ lda (dp),y
+ sta mlast
+ iny
+ lda (dp),y
+ sta mlast+1
+ iny
+ lda (dp),y
+ sta mfirst
+ iny
+ lda (dp),y
+ sta mfirst+1
+ iny
+ lda (dp),y
+ sta mlen
+ iny
+ lda (dp),y
+ sta mlen+1
+ iny
+ lda (dp),y
+ sta minit
+ iny
+ lda (dp),y
+ sta minit+1
+ iny
+ lda (dp),y
+ sta mnrel
+ iny
+ lda (dp),y
+ sta mnrel+1
+* the fixup list sits just past the image
+ clc
+ lda mbase
+ adc mlen
+ sta mrel
+ lda mbase+1
+ adc mlen+1
+ sta mrel+1
+* walk it, adding the load address to each
+* word it points at
+mlrl lda mnrel
+ ora mnrel+1
+ beq mldone
+ ldy #0
+ lda (mrel),y
+ sta t1
+ iny
+ lda (mrel),y
+ sta t1+1
+ clc
+ lda mbase
+ adc t1
+ sta t2
+ lda mbase+1
+ adc t1+1
+ sta t2+1
+ ldy #0
+ clc
+ lda (t2),y
+ adc mbase
+ sta (t2),y
+ iny
+ lda (t2),y
+ adc mbase+1
+ sta (t2),y
+ clc
+ lda mrel
+ adc #2
+ sta mrel
+ bcc mlrl1
+ inc mrel+1
+mlrl1 lda mnrel
+ bne mlrl2
+ dec mnrel+1
+mlrl2 dec mnrel
+ jmp mlrl
+* link the module's chain onto ours
+mldone clc
+ lda mbase
+ adc mfirst
+ sta t2
+ lda mbase+1
+ adc mfirst+1
+ sta t2+1
+ ldy #0
+ lda lst
+ sta (t2),y
+ iny
+ lda lst+1
+ sta (t2),y
+ clc
+ lda mbase
+ adc mlast
+ sta lst
+ lda mbase+1
+ adc mlast+1
+ sta lst+1
+* the dictionary now starts past the module
+ clc
+ lda mbase
+ adc mlen
+ sta dp
+ lda mbase+1
+ adc mlen+1
+ sta dp+1
+* and let it set itself up
+ clc
+ lda mbase
+ adc minit
+ sta mljmp+1
+ lda mbase+1
+ adc minit+1
+ sta mljmp+2
+ jsr mljmp
+ clc
+ rts
+mljmp jmp $0000
+* setnam - copy a counted name into PATH
+* in: A/Y point at it, low/high
+setnam sta t1
+ sty t1+1
+ ldy #0
+ lda (t1),y
+ sta t3
+ tay
+snm1 lda (t1),y
+ sta path,y
+ dey
+ bpl snm1
+ rts
+* bootld - read FORTH.WORDS into the log
+* carry clear if there is source to interpret
+bootld jsr setpth
+ jsr openf
+ bcs blno
+ lda refnum
+ sta rdparm+1
+ lda logp
+ sta rdparm+2
+ lda logp+1
+ sta rdparm+3
+ sec
+ lda #<logend
+ sbc logp
+ sta rdparm+4
+ lda #>logend
+ sbc logp+1
+ sta rdparm+5
+ jsr mli
+ dfb $ca
+ da rdparm
+ bcc blok
+ cmp #$4c
+ beq blok
+ jsr closef
+ sec
+ rts
+blok jsr closef
+ lda logp
+ sta srcp
+ lda logp+1
+ sta srcp+1
+ clc
+ lda logp
+ adc rdparm+6
+ sta logp
+ lda logp+1
+ adc rdparm+7
+ sta logp+1
+ lda logp
+ sta srcend
+ lda logp+1
+ sta srcend+1
+ lda #1
+ sta nolog
+ sta bootf
+ clc
+ rts
+blno sec
+ rts
+* single quotes = high bit clear, as ProDOS wants
+wname dfb 11
+ asc 'FORTH.WORDS'
+* Warm start: read a line
+warm ldx #$ff
+ txs
+ jsr crout
+ lda #$fe ;"~"
+ jsr cout
+ jsr rdcmd
+ cpx #0
+ beq warm
+ stx linlen
+ stz nolog
+ stz forceg
+ lda #<inbuf
+ sta srcp
+ lda #>inbuf
+ sta srcp+1
+ txa
+ clc
+ adc #<inbuf
+ sta srcend
+ lda #>inbuf
+ adc #0
+ sta srcend+1
+ lda dp
+ sta dpsave
+ lda dp+1
+ sta dpsave+1
+* interpret/compile loop
+nxtwd jsr word
+ lda tlen
+ beq lineend
+ jsr find
+ bcs nwnum
+ lda state
+ beq doexec
+ ldy #2
+ lda (curr),y
+ and #$80
+ bne doexec
+ lda xcfa
+ sta t1
+ lda xcfa+1
+ sta t1+1
+ jsr comma
+ jmp nxtwd
+doexec jmp execute
+nwnum jsr number
+ bcs nwbad
+ sty t2
+ sta t2+1
+ lda state
+ beq nwpush
+ lda #<cf_lit
+ sta t1
+ lda #>cf_lit
+ sta t1+1
+ jsr comma
+ lda t2
+ sta t1
+ lda t2+1
+ sta t1+1
+ jsr comma
+ jmp nxtwd
+nwpush lda t2+1
+ ldy t2
+ jsr push
+ jmp nxtwd
+* An error abandons the line. If we were part
+* way through a definition, throw it away and
+* go back to interpreting - otherwise one typo
+* leaves the system stuck in compile mode.
+nwbad lda #"?"
+ jsr cout
+ jsr crout
+ lda state
+ beq nwb1
+ stz state
+ lda cdef
+ sta dp
+ lda cdef+1
+ sta dp+1
+nwb1 jmp warm
+lineend jsr logline
+ lda bootf
+ beq lineend2
+ sta tmp                ; which one was it
+ stz bootf
+ lda #<srclog
+ sta logp
+ lda #>srclog
+ sta logp+1
+* remember where the standard library ended.
+* CLEAR forgets back to here, not all the way
+* to the kernel, so it cannot destroy the
+* library; and GREN uses it to insist on being
+* the first word of a definition file.
+ lda dp
+ sta dpboot
+ lda dp+1
+ sta dpboot+1
+ lda lst
+ sta lstboot
+ lda lst+1
+ sta lstboot+1
+ lda tmp
+ cmp #2
+ beq lineend2          ; that was STARTUP
+*=============================================
+* startld - the disk's own program
+*
+* FORTH.WORDS has just finished. If a text
+* file called STARTUP is on the disk, it is
+* read and interpreted the same way - so a
+* file which ends by calling its own top word
+* is a program, and the disk it sits on boots
+* straight into it.
+*
+* Nothing new is needed to make this work.
+* LOAD has interpreted text since Part 5; all
+* that is added here is the decision to look
+* for the file.
+*=============================================
+startld lda #<sname
+ ldy #>sname
+ jsr setnam
+ jsr bootld
+ bcs startno
+ lda #2                 ; so LINEEND knows
+ sta bootf
+ jmp nxtwd
+startno stz bootf       ; no program: just the prompt
+lineend2 jmp warm
+sname dfb 7
+ asc 'STARTUP'
+* logline - log the line only if dp ADVANCED
+logline lda nolog
+ bne logret
+ lda forceg             ; a declaration is always
+ bne logdo              ; worth keeping
+ lda dpsave+1
+ cmp dp+1
+ bcc logdo
+ bne logret
+ lda dpsave
+ cmp dp
+ bcs logret
+logdo lda logp+1
+ cmp #>logmax
+ bcs logret
+ ldy #0
+logcp cpy linlen
+ bcs logcr
+ lda inbuf,y
+ sta (logp),y
+ iny
+ bne logcp
+logcr lda #$8d
+ sta (logp),y
+ tya
+ sec
+ adc logp
+ sta logp
+ lda logp+1
+ adc #0
+ sta logp+1
+logret rts
+* word - next token at (srcp) up to srcend
+word jsr atend
+ bcs wdnone
+ ldy #0
+ lda (srcp),y
+ and #$7f
+ cmp #$21
+ bcs wdstrt
+ jsr srcinc
+ jmp word
+wdnone stz tlen
+ rts
+wdstrt lda srcp
+ sta tibp
+ lda srcp+1
+ sta tibp+1
+ ldx #0
+wdcnt jsr atend
+ bcs wddn
+ ldy #0
+ lda (srcp),y
+ and #$7f
+ cmp #$21
+ bcc wddn
+ inx
+ jsr srcinc
+ jmp wdcnt
+wddn stx tlen
+ rts
+* atend - carry set if srcp >= srcend
+atend lda srcp+1
+ cmp srcend+1
+ bcc atno
+ bne atyes
+ lda srcp
+ cmp srcend
+ bcc atno
+atyes sec
+ rts
+atno clc
+ rts
+* srcinc - srcp = srcp + 1
+srcinc inc srcp
+ bne srci1
+ inc srcp+1
+srci1 rts
+* rdcmd - read a command line -> inbuf, X=len
+*=============================================
+* getkey - a key, and some entropy with it
+*
+* The machine has no clock and no noise. What
+* it does have is a person, and people are not
+* punctual. While the monitor waits for a key
+* it counts, over and over, in $4E and $4F; by
+* the time a key arrives that count holds the
+* low bits of how long the wait was, which is
+* the one thing about this machine nobody can
+* predict.
+*
+* So every keystroke stirs the generator. A
+* program that asks for a random number after
+* the user has typed anything at all starts
+* from somewhere unrepeatable - and one that
+* wants the SAME game twice can say SEED.
+*=============================================
+getkey jsr rdkey
+ pha
+ lda rndl
+ eor rnd+2
+ sta rnd+2
+ lda rndl+1
+ eor rnd+3
+ sta rnd+3
+ pla
+ rts
+*=============================================
+* rndnxt - sixteen more random bits
+* out: A = high byte, Y = low byte
+*
+* A 32-bit shift register whose feedback taps
+* make it run through all 4,294,967,295 states
+* before it repeats. The taps matter: pick the
+* wrong ones and it still looks random, still
+* passes a casual glance, and quietly cycles
+* after a few thousand draws. These are for
+* x^32 + x^7 + x^5 + x^3 + x^2 + x + 1, which
+* is a primitive polynomial - and every tap
+* below eight, so the feedback touches one
+* byte instead of four.
+*
+* All zeroes is the one state it cannot leave,
+* so that is checked rather than hoped about.
+*=============================================
+rndnxt lda rnd
+ ora rnd+1
+ ora rnd+2
+ ora rnd+3
+ bne rndn1
+ lda #1                 ; a dead register stays dead
+ sta rnd
+rndn1 ldx #16
+rndn2 asl rnd
+ rol rnd+1
+ rol rnd+2
+ rol rnd+3
+ bcc rndn3
+ lda rnd
+ eor #$af               ; the taps, all in one byte
+ sta rnd
+rndn3 dex
+ bne rndn2
+ lda rnd+3
+ ldy rnd+2
+ rts
+rnd dfb 1,0,0,0         ; never all zero to begin with
+rdcmd stz lcnt
+rdc1 jsr getkey
+ cmp #$8d
+ beq rdcend
+ cmp #$88
+ beq rdcbs
+ cmp #$a0
+ bcc rdc1
+ ldx lcnt
+ sta inbuf,x
+ jsr cout
+ inc lcnt
+ jmp rdc1
+rdcbs lda lcnt
+ beq rdc1
+ dec lcnt
+ lda #$88
+ jsr cout
+ lda #$a0
+ jsr cout
+ lda #$88
+ jsr cout
+ jmp rdc1
+rdcend jsr crout
+ ldx lcnt
+ rts
+* comma - append 16-bit t1 to dict at dp
+comma ldy #0
+ lda t1
+ sta (dp),y
+ iny
+ lda t1+1
+ sta (dp),y
+ clc
+ lda dp
+ adc #2
+ sta dp
+ bcc cmdone
+ inc dp+1
+cmdone rts
+* find - token -> xcfa (carry clear=found)
+find lda lst
+ sta curr
+ lda lst+1
+ sta curr+1
+find1 ldy #2
+ lda (curr),y
+ and #$1f
+ cmp tlen
+ bne findnx
+ lda curr
+ clc
+ adc #3
+ sta nptr
+ lda curr+1
+ adc #0
+ sta nptr+1
+ ldy #0
+findc lda (nptr),y
+ and #$7f
+ sta tmp
+ lda (tibp),y
+ and #$7f
+ cmp tmp
+ bne findnx
+ iny
+ cpy tlen
+ bne findc
+ lda nptr
+ clc
+ adc tlen
+ sta xcfa
+ lda nptr+1
+ adc #0
+ sta xcfa+1
+ clc
+ rts
+findnx ldy #0
+ lda (curr),y
+ pha
+ iny
+ lda (curr),y
+ sta curr+1
+ pla
+ sta curr
+ lda curr
+ ora curr+1
+ bne find1
+ sec
+ rts
+* number - token -> value (A=hi,Y=lo)
+number ldy #0
+ stz nacc
+ stz nacc+1
+ stz nsign
+ lda (tibp),y
+ and #$7f
+ cmp #$2d ;"-"
+ bne ndig
+ inc nsign
+ iny
+ cpy tlen
+ beq nbad
+ndig lda (tibp),y
+ and #$7f
+ jsr digit
+ bcs nbad
+ jsr mulbase
+ lda ndigit
+ clc
+ adc nacc
+ sta nacc
+ bcc nnoc
+ inc nacc+1
+nnoc iny
+ cpy tlen
+ bne ndig
+ lda nsign
+ beq npos
+ sec
+ lda #0
+ sbc nacc
+ sta nacc
+ lda #0
+ sbc nacc+1
+ sta nacc+1
+npos lda nacc
+ tay
+ lda nacc+1
+ clc
+ rts
+nbad sec
+ rts
+* digit - A=char -> ndigit, C clear if valid
+digit cmp #$30
+ bcc dbad
+ cmp #$3a
+ bcs dga
+ sec
+ sbc #$30
+ jmp dchk
+dga cmp #$41
+ bcc dbad
+ cmp #$5b
+ bcs dgl
+ sec
+ sbc #$37
+ jmp dchk
+dgl cmp #$61
+ bcc dbad
+ cmp #$7b
+ bcs dbad
+ sec
+ sbc #$57
+dchk sta ndigit
+ cmp base
+ bcs dbad
+ clc
+ rts
+dbad sec
+ rts
+* mulbase - nacc = nacc * base
+mulbase lda nacc
+ sta t1
+ lda nacc+1
+ sta t1+1
+ stz nacc
+ stz nacc+1
+ ldx base
+mb1 clc
+ lda nacc
+ adc t1
+ sta nacc
+ lda nacc+1
+ adc t1+1
+ sta nacc+1
+ dex
+ bne mb1
+ rts
+* div16 - nacc = nacc / base, nrem = remainder
+div16 stz nrem
+ ldx #16
+dv1 asl nacc
+ rol nacc+1
+ rol nrem
+ lda nrem
+ cmp base
+ bcc dv2
+ sbc base
+ sta nrem
+ inc nacc
+dv2 dex
+ bne dv1
+ rts
+* prnum - print nacc unsigned in current base
+prnum stz ndcnt
+pn1 jsr div16
+ lda nrem
+ cmp #10
+ bcc pn2
+ clc
+ adc #7
+pn2 clc
+ adc #$30
+ ldx ndcnt
+ sta numbuf,x
+ inc ndcnt
+ lda nacc
+ ora nacc+1
+ bne pn1
+ ldx ndcnt
+pn3 dex
+ lda numbuf,x
+ ora #$80
+ jsr cout
+ cpx #0
+ bne pn3
+ rts
+* ---------- 32-bit arithmetic core ----------
+* negzp - negate the 2-byte value at zp,X
+negzp sec
+ lda #0
+ sbc $00,x
+ sta $00,x
+ lda #0
+ sbc $01,x
+ sta $01,x
+ rts
+* absx - abs the value at zp,X; flip dsgn if neg
+absx lda $01,x
+ bpl absxd
+ lda dsgn
+ eor #1
+ sta dsgn
+ jsr negzp
+absxd rts
+* negd - negate the 32-bit dacc
+negd sec
+ lda #0
+ sbc dacc
+ sta dacc
+ lda #0
+ sbc dacc+1
+ sta dacc+1
+ lda #0
+ sbc dacc+2
+ sta dacc+2
+ lda #0
+ sbc dacc+3
+ sta dacc+3
+ rts
+* umul - dacc = t1 * t2, unsigned 16x16->32
+umul stz dacc
+ stz dacc+1
+ stz dacc+2
+ stz dacc+3
+ ldx #16
+um1 asl dacc
+ rol dacc+1
+ rol dacc+2
+ rol dacc+3
+ asl t2
+ rol t2+1
+ bcc um2
+ clc
+ lda dacc
+ adc t1
+ sta dacc
+ lda dacc+1
+ adc t1+1
+ sta dacc+1
+ lda dacc+2
+ adc #0
+ sta dacc+2
+ lda dacc+3
+ adc #0
+ sta dacc+3
+um2 dex
+ bne um1
+ rts
+* ddiv - dacc = dacc / t1, dtmp = remainder
+ddiv stz dtmp
+ stz dtmp+1
+ ldx #32
+dd1 asl dacc
+ rol dacc+1
+ rol dacc+2
+ rol dacc+3
+ rol dtmp
+ rol dtmp+1
+ lda dtmp+1
+ cmp t1+1
+ bcc dd2
+ bne dd3
+ lda dtmp
+ cmp t1
+ bcc dd2
+dd3 sec
+ lda dtmp
+ sbc t1
+ sta dtmp
+ lda dtmp+1
+ sbc t1+1
+ sta dtmp+1
+ inc dacc
+dd2 dex
+ bne dd1
+ rts
+* pushd - push dacc as a double (low then high)
+pushd lda dacc+1
+ ldy dacc
+ jsr push
+ lda dacc+3
+ ldy dacc+2
+ jsr push
+ rts
+* popd - pop a double into dacc
+popd jsr pop
+ sta dacc+3
+ sty dacc+2
+ jsr pop
+ sta dacc+1
+ sty dacc
+ rts
+* prdnum - print dacc unsigned in current base
+prdnum stz ndcnt
+pd1 lda base
+ sta t1
+ stz t1+1
+ jsr ddiv
+ lda dtmp
+ cmp #10
+ bcc pd2
+ clc
+ adc #7
+pd2 clc
+ adc #$30
+ ldx ndcnt
+ sta numbuf,x
+ inc ndcnt
+ lda dacc
+ ora dacc+1
+ ora dacc+2
+ ora dacc+3
+ bne pd1
+ ldx ndcnt
+pd3 dex
+ lda numbuf,x
+ ora #$80
+ jsr cout
+ cpx #0
+ bne pd3
+ rts
+* divcore - pop divisor and dividend, divide
+* dacc = quotient, dtmp = remainder
+* carry set if divide by zero
+divcore jsr pop
+ sty t1
+ sta t1+1
+ jsr pop
+ sty t2
+ sta t2+1
+ lda t1
+ ora t1+1
+ beq dcz
+ stz dsgn
+ stz msgn
+ ldx #t1
+ jsr absx
+ lda t2+1
+ bpl dc1
+ inc msgn
+dc1 ldx #t2
+ jsr absx
+ lda t2
+ sta dacc
+ lda t2+1
+ sta dacc+1
+ stz dacc+2
+ stz dacc+3
+ jsr ddiv
+ lda dsgn
+ beq dc2
+ jsr negd
+dc2 lda msgn
+ beq dc3
+ ldx #dtmp
+ jsr negzp
+dc3 clc
+ rts
+dcz sec
+ rts
+* ---------- file support ----------
+* getname - parse " NAME " into path
+getname jsr word
+ lda tlen
+ beq gnbad
+ cmp #1
+ bne gnbld
+ ldy #0
+ lda (tibp),y
+ and #$7f
+ cmp #$22
+ bne gnbld
+ jsr word
+ lda tlen
+ beq gnbad
+gnbld lda tlen
+ cmp #65
+ bcs gnbad
+ sta path
+ ldy #0
+gncp lda (tibp),y
+ and #$7f
+ cmp #$61
+ bcc gncp2
+ cmp #$7b
+ bcs gncp2
+ sec
+ sbc #$20
+gncp2 sta path+1,y
+ iny
+ cpy tlen
+ bne gncp
+ lda srcp
+ sta t1
+ lda srcp+1
+ sta t1+1
+ jsr word
+ lda tlen
+ cmp #1
+ bne gnrst
+ ldy #0
+ lda (tibp),y
+ and #$7f
+ cmp #$22
+ beq gnok
+gnrst lda t1
+ sta srcp
+ lda t1+1
+ sta srcp+1
+gnok clc
+ rts
+gnbad sec
+ rts
+* setpth - point parm blocks at path
+setpth lda #<path
+ sta crparm+1
+ sta opparm+1
+ sta dsparm+1
+ lda #>path
+ sta crparm+2
+ sta opparm+2
+ sta dsparm+2
+ rts
+* getpfx - current prefix into path
+getpfx lda #<path
+ sta gpparm+1
+ lda #>path
+ sta gpparm+2
+ jsr mli
+ dfb $c7
+ da gpparm
+ rts
+* creatf - create the file (destroy if dup)
+creatf jsr mli
+ dfb $c0
+ da crparm
+ bcc crok
+ cmp #$47
+ bne crbad
+ jsr mli
+ dfb $c1
+ da dsparm
+ bcs crbad
+ jsr mli
+ dfb $c0
+ da crparm
+ bcs crbad
+crok clc
+ rts
+crbad sec
+ rts
+* openf - open path, refnum set
+openf jsr mli
+ dfb $c8
+ da opparm
+ rts
+* closef - close refnum
+closef lda refnum
+ sta clparm+1
+ jsr mli
+ dfb $cc
+ da clparm
+ rts
+*=============================================
+* binld - read a binary file in at DP
+*
+* The one place that knows how to bring a lump
+* of bytes in from the disk. BLOAD uses it,
+* and so does LOAD when it recognises a data
+* file. Reading at DP means the file takes
+* dictionary space like anything else, and
+* CLEAR forgets it along with everything else.
+*
+* in:  PATH set up, parm blocks pointed at it
+* out: T1 = where it landed, DP past the end,
+*      carry set and A = the ProDOS error if
+*      it would not load
+*=============================================
+binld jsr openf
+ bcs binbad
+ lda dp                 ; remember where it goes
+ sta t1
+ lda dp+1
+ sta t1+1
+ lda refnum
+ sta rdparm+1
+ lda dp
+ sta rdparm+2
+ lda dp+1
+ sta rdparm+3
+ sec                    ; read at most what fits
+ lda #$00
+ sbc dp
+ sta rdparm+4
+ lda #$bf
+ sbc dp+1
+ sta rdparm+5
+ jsr mli
+ dfb $ca
+ da rdparm
+ bcc binok
+ cmp #$4c               ; end of file is success
+ beq binok
+ sta tmp
+ jsr closef
+ lda tmp
+ sec
+ rts
+binok jsr closef
+ clc                    ; step DP over what arrived
+ lda dp
+ adc rdparm+6
+ sta dp
+ lda dp+1
+ adc rdparm+7
+ sta dp+1
+ clc
+ rts
+binbad sec
+ rts
+*=============================================
+* chkext - what kind of file is PATH naming?
+*
+* out: A = 0 source, 1 block shapes, 2 tunes
+*
+* The extension is the declaration. A file
+* called GAME.SHP announces what it is, so a
+* program that says LOAD GAME.SHP documents
+* its own requirements, and one LOAD serves
+* every kind of file. GETNAME has already
+* upper-cased the name for ProDOS, so only one
+* case has to be tested here.
+*=============================================
+chkext ldx path         ; the length is byte zero
+ cpx #4
+ bcc chkno              ; too short to have one
+ lda path-3,x
+ cmp #$2e ;"."
+ bne chkno
+ lda path-2,x
+ cmp #$53 ;"S"
+ bne chkno
+ lda path-1,x
+ cmp #$48 ;"H"
+ beq chkshp
+ cmp #$4e ;"N"
+ bne chkno
+ lda path,x
+ cmp #$44 ;"D"
+ bne chkno
+ lda #2                 ; .SND
+ rts
+chkshp lda path,x
+ cmp #$50 ;"P"
+ bne chkno
+ lda #1                 ; .SHP
+ rts
+chkno lda #0
+ rts
+* prerr - print ERR nn
+prerr pha
+ ldy #0
+perl lda merr,y
+ beq perd
+ jsr cout
+ iny
+ bne perl
+perd pla
+ jsr prbyte
+ jsr crout
+ rts
+merr asc "ERR "
+ dfb 0
+* prok - print OK
+prok ldy #0
+prokl lda mok,y
+ beq prokd
+ jsr cout
+ iny
+ bne prokl
+prokd jsr crout
+ rts
+mok asc "OK"
+ dfb 0
+* ferr - report A as a ProDOS error, resume
+ferr jsr prerr
+ jmp next
+* fqerr - bad or missing argument
+fqerr lda #"?"
+ jsr cout
+ jsr crout
+ jmp next
+* --- MLI parameter blocks ---
+crparm dfb $07
+ da 0
+ dfb $e3
+ dfb $04
+ da $0000
+ dfb $01
+ da $0000
+ da $0000
+dsparm dfb $01
+ da 0
+opparm dfb $03
+ da 0
+ da iobuf
+refnum dfb 0
+clparm dfb $01
+ dfb 0
+rdparm dfb $04
+ dfb 0
+ da 0
+ da 0
+ da 0
+wrparm dfb $04
+ dfb 0
+ da 0
+ da 0
+ da 0
+spparm dfb $01
+ da 0
+gpparm dfb $01
+ da 0
+onparm dfb $02
+ dfb $00 ; unit, patched from DEVNUM
+ da onbuf
+* execute - run word in xcfa, back via RET
+execute lda xcfa
+ sta runth
+ lda xcfa+1
+ sta runth+1
+ lda #<runth
+ sta ip
+ lda #>runth
+ sta ip+1
+ jmp next
+runth da 0
+ da cf_ret
+* Inner interpreter
+next ldy #0
+ lda (ip),y
+ sta w
+ iny
+ lda (ip),y
+ sta w+1
+ clc
+ lda ip
+ adc #2
+ sta ip
+ bcc next1
+ inc ip+1
+next1 ldy #0
+ lda (w),y
+ sta cp
+ iny
+ lda (w),y
+ sta cp+1
+ jmp (cp)
+docol lda ip+1
+ pha
+ lda ip
+ pha
+ clc
+ lda w
+ adc #2
+ sta ip
+ lda w+1
+ adc #0
+ sta ip+1
+ jmp next
+cf_exit da exit
+exit pla
+ sta ip
+ pla
+ sta ip+1
+ jmp next
+*=============================================
+* DOVAR - what a CREATEd word does
+*
+* A word made by CREATE has this shape:
+*
+*   link  len  name  CFA  DOESP  data...
+*
+* CFA points here, DOESP is the cell DOES>
+* fills in, and the data begins four bytes past
+* the code field. So all this has to do is push
+* W+4 - the address of the word's own data.
+*=============================================
+dovar clc
+ lda w
+ adc #4
+ sta t1
+ lda w+1
+ adc #0
+ ldy t1
+ jsr push
+ jmp next
+*=============================================
+* DODOES - what a word made by a DOES> defining
+* word does
+*
+* Push the data address exactly as DOVAR would,
+* then go and run the FORTH that followed DOES>
+* in whatever word created us. Which is DOCOL's
+* job with one difference: the code to run is
+* not at W+2, it is the address STORED at W+2.
+*=============================================
+dodoes clc
+ lda w
+ adc #4
+ sta t1
+ lda w+1
+ adc #0
+ ldy t1
+ jsr push
+ lda ip+1
+ pha
+ lda ip
+ pha
+ ldy #2
+ lda (w),y
+ sta t1
+ iny
+ lda (w),y
+ sta ip+1
+ lda t1
+ sta ip
+ jmp next
+*=============================================
+* DODO - the runtime DOES> compiles
+*
+* Runs while the DEFINING word is executing,
+* just after it has CREATEd something. Two
+* stores and a return:
+*
+*   the new word's code field  ->  DODOES
+*   the new word's DOESP cell  ->  IP
+*
+* IP is pointing at whatever follows DOES> in
+* the defining word, which is exactly the code
+* the new word should run. Then we exit the
+* defining word, because everything after DOES>
+* belongs to the child and not to the parent.
+*=============================================
+dodo lda lastcf         ; no zero page pair to spare,
+ sta t1                 ; so borrow the scratch one
+ lda lastcf+1
+ sta t1+1
+ ldy #0
+ lda #<dodoes
+ sta (t1),y
+ iny
+ lda #>dodoes
+ sta (t1),y
+ iny
+ lda ip
+ sta (t1),y
+ iny
+ lda ip+1
+ sta (t1),y
+ pla                    ; and leave the parent
+ sta ip
+ pla
+ sta ip+1
+ jmp next
+cf_dodo da dodo
+cf_lit da lit
+lit ldy #0
+ lda (ip),y
+ sta tmp
+ ldy #1
+ lda (ip),y
+ ldy tmp
+ jsr push
+ clc
+ lda ip
+ adc #2
+ sta ip
+ bcc lit1
+ inc ip+1
+lit1 jmp next
+cf_ret da doret
+doret jmp nxtwd
+* ---- runtime words used by the compiler ----
+* they have no headers; only the compiler
+* refers to them, by CFA
+* branch - jump to the address stored inline
+cf_bran da branw
+branw ldy #0
+ lda (ip),y
+ tax
+ iny
+ lda (ip),y
+ sta ip+1
+ stx ip
+ jmp next
+* 0branch - branch if the popped flag is zero
+cf_zbran da zbranw
+zbranw jsr pop
+ sty t1
+ sta t1+1
+ lda t1
+ ora t1+1
+ beq branw
+ clc
+ lda ip
+ adc #2
+ sta ip
+ bcc zbr1
+ inc ip+1
+zbr1 jmp next
+* (do) - move limit and index to the loop stack
+cf_pdo da pdow
+pdow jsr pop
+ sty t1
+ sta t1+1
+ jsr pop
+ sty t2
+ sta t2+1
+ ldx lsp
+ lda t1
+ sta loopstk,x
+ lda t1+1
+ sta loopstk+1,x
+ lda t2
+ sta loopstk+2,x
+ lda t2+1
+ sta loopstk+3,x
+ txa
+ clc
+ adc #4
+ sta lsp
+ jmp next
+* (loop) - bump the index, branch back or exit
+cf_ploop da ploopw
+ploopw ldx lsp
+ dex
+ dex
+ dex
+ dex
+ inc loopstk,x
+ bne pl1
+ inc loopstk+1,x
+pl1 sec
+ lda loopstk,x
+ sbc loopstk+2,x
+ lda loopstk+1,x
+ sbc loopstk+3,x
+ bvc pl2
+ eor #$80
+pl2 bmi branw
+ stx lsp
+ clc
+ lda ip
+ adc #2
+ sta ip
+ bcc pl3
+ inc ip+1
+pl3 jmp next
+* initz - clear stack, reset pointers
+initz ldx #0
+iz1 stz stklo,x
+ stz stkhi,x
+ dex
+ bne iz1
+ dex
+ stx sptr
+ lda #10
+ sta base
+ stz lsp
+ stz bootf
+ stz envflg
+ stz forceg
+ stz nolog
+ lda #<dict
+ sta dp
+ sta dpboot
+ lda #>dict
+ sta dp+1
+ sta dpboot+1
+ lda #<latest
+ sta lst
+ sta lstboot
+ lda #>latest
+ sta lst+1
+ sta lstboot+1
+ stz state
+ lda #<srclog
+ sta logp
+ lda #>srclog
+ sta logp+1
+ rts
+* push - A=hi, Y=lo -> stack
+push ldx sptr
+ beq pusherr
+ sta stkhi,x
+ tya
+ sta stklo,x
+ dex
+ stx sptr
+ clc
+ rts
+pusherr lda #$02
+ sec
+ rts
+* pop - stack -> A=hi, Y=lo
+pop ldx sptr
+ inx
+ beq poperr
+ lda stklo,x
+ tay
+ lda stkhi,x
+ stx sptr
+ clc
+ rts
+poperr lda #$01
+ sec
+ rts
+* peek - top -> A=hi, Y=lo
+peek ldx sptr
+ inx
+ beq poperr
+ lda stklo,x
+ tay
+ lda stkhi,x
+ clc
+ rts
+* Dictionary
+* header = link(2) len(1) name cfa(2) body
+* + ( n1 n2 -- sum )
+h_plus da 0
+ dfb 1
+ asc "+"
+cf_plus da plus
+plus jsr pop
+ sty t1
+ sta t1+1
+ jsr pop
+ sty t2
+ sta t2+1
+ clc
+ lda t1
+ adc t2
+ tay
+ lda t1+1
+ adc t2+1
+ jsr push
+ jmp next
+* - ( n1 n2 -- n1-n2 )
+h_minus da h_plus
+ dfb 1
+ asc "-"
+cf_minus da minus
+minus jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ sec
+ lda t1
+ sbc t2
+ tay
+ lda t1+1
+ sbc t2+1
+ jsr push
+ jmp next
+* . ( n -- ) signed, current base
+h_dot da h_minus
+ dfb 1
+ asc "."
+cf_dot da dot
+dot jsr pop
+ sta nacc+1
+ sty nacc
+ lda nacc+1
+ bpl dotp
+ lda #"-"
+ jsr cout
+ sec
+ lda #0
+ sbc nacc
+ sta nacc
+ lda #0
+ sbc nacc+1
+ sta nacc+1
+dotp jsr prnum
+ lda #" "
+ jsr cout
+ jmp next
+* U. ( u -- ) unsigned, current base
+h_udot da h_dot
+ dfb 2
+ asc "U."
+cf_udot da udot
+udot jsr pop
+ sta nacc+1
+ sty nacc
+ jsr prnum
+ lda #" "
+ jsr cout
+ jmp next
+* H. ( n -- ) fixed 4-digit hex
+h_hdot da h_udot
+ dfb 2
+ asc "H."
+cf_hdot da hdot
+hdot jsr pop
+ phy
+ jsr prbyte
+ ply
+ tya
+ jsr prbyte
+ lda #" "
+ jsr cout
+ jmp next
+* D. ( d -- ) signed double
+h_ddot da h_hdot
+ dfb 2
+ asc "D."
+cf_ddot da ddot
+ddot jsr popd
+ lda dacc+3
+ bpl ddotp
+ lda #"-"
+ jsr cout
+ jsr negd
+ddotp jsr prdnum
+ lda #" "
+ jsr cout
+ jmp next
+* UD. ( ud -- ) unsigned double
+h_uddot da h_ddot
+ dfb 3
+ asc "UD."
+cf_uddot da uddot
+uddot jsr popd
+ jsr prdnum
+ lda #" "
+ jsr cout
+ jmp next
+* pushf0 / pushf1 - push a false / true flag
+pushf0 lda #0
+ tay
+ jsr push
+ jmp next
+pushf1 lda #0
+ ldy #1
+ jsr push
+ jmp next
+* DUP ( n -- n n )
+h_dup da h_uddot
+ dfb 3
+ asc "DUP"
+cf_dup da dup
+dup jsr peek
+ jsr push
+ jmp next
+* DROP ( n -- )
+h_drop da h_dup
+ dfb 4
+ asc "DROP"
+cf_drop da dropw
+dropw jsr pop
+ jmp next
+* SWAP ( a b -- b a )
+h_swap da h_drop
+ dfb 4
+ asc "SWAP"
+cf_swap da swapw
+swapw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t2+1
+ ldy t2
+ jsr push
+ lda t1+1
+ ldy t1
+ jsr push
+ jmp next
+* OVER ( a b -- a b a )
+h_over da h_swap
+ dfb 4
+ asc "OVER"
+cf_over da overw
+overw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t1+1
+ ldy t1
+ jsr push
+ lda t2+1
+ ldy t2
+ jsr push
+ lda t1+1
+ ldy t1
+ jsr push
+ jmp next
+* ROT ( a b c -- b c a )
+h_rot da h_over
+ dfb 3
+ asc "ROT"
+cf_rot da rotw
+rotw jsr pop
+ sty t3
+ sta t3+1
+ jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t2+1
+ ldy t2
+ jsr push
+ lda t3+1
+ ldy t3
+ jsr push
+ lda t1+1
+ ldy t1
+ jsr push
+ jmp next
+* * ( n1 n2 -- prod ) low 16 bits
+h_star da h_rot
+ dfb 1
+ asc "*"
+cf_star da star
+star jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ jsr umul
+ lda dacc
+ tay
+ lda dacc+1
+ jsr push
+ jmp next
+* /MOD ( n1 n2 -- rem quot )
+h_smod da h_star
+ dfb 4
+ asc "/MOD"
+cf_smod da smodw
+smodw jsr divcore
+ bcs smz
+ lda dtmp
+ tay
+ lda dtmp+1
+ jsr push
+ lda dacc
+ tay
+ lda dacc+1
+ jsr push
+ jmp next
+smz jmp fqerr
+* M* ( n1 n2 -- d ) signed 16x16->32
+h_mstar da h_smod
+ dfb 2
+ asc "M*"
+cf_mstar da mstar
+mstar jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ stz dsgn
+ ldx #t1
+ jsr absx
+ ldx #t2
+ jsr absx
+ jsr umul
+ lda dsgn
+ beq msp
+ jsr negd
+msp jsr pushd
+ jmp next
+* U* ( u1 u2 -- ud ) unsigned 16x16->32
+h_ustar da h_mstar
+ dfb 2
+ asc "U*"
+cf_ustar da ustar
+ustar jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ jsr umul
+ jsr pushd
+ jmp next
+* */MOD ( n1 n2 n3 -- rem quot )
+h_sslm da h_ustar
+ dfb 5
+ asc "*/MOD"
+cf_sslm da sslmw
+sslmw jsr sslcm
+ bcs sslmz
+ lda dtmp
+ tay
+ lda dtmp+1
+ jsr push
+ lda dacc
+ tay
+ lda dacc+1
+ jsr push
+ jmp next
+sslmz jmp fqerr
+* sslcm - common n1*n2/n3 with 32-bit middle
+sslcm jsr pop
+ sty t3
+ sta t3+1
+ jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t3
+ ora t3+1
+ beq sslcz
+ stz dsgn
+ ldx #t1
+ jsr absx
+ ldx #t2
+ jsr absx
+ ldx #t3
+ jsr absx
+ jsr umul
+ lda t3
+ sta t1
+ lda t3+1
+ sta t1+1
+ jsr ddiv
+ lda dsgn
+ beq sslcp
+ jsr negd
+sslcp clc
+ rts
+sslcz sec
+ rts
+* D+ ( d1 d2 -- d )
+h_dplus da h_sslm
+ dfb 2
+ asc "D+"
+cf_dplus da dplusw
+dplusw jsr popd
+ lda dacc
+ sta dtmp
+ lda dacc+1
+ sta dtmp+1
+ lda dacc+2
+ sta dtmp+2
+ lda dacc+3
+ sta dtmp+3
+ jsr popd
+ clc
+ lda dacc
+ adc dtmp
+ sta dacc
+ lda dacc+1
+ adc dtmp+1
+ sta dacc+1
+ lda dacc+2
+ adc dtmp+2
+ sta dacc+2
+ lda dacc+3
+ adc dtmp+3
+ sta dacc+3
+ jsr pushd
+ jmp next
+* DNEGATE ( d -- -d )
+h_dneg da h_dplus
+ dfb 7
+ asc "DNEGATE"
+cf_dneg da dnegw
+dnegw jsr popd
+ jsr negd
+ jsr pushd
+ jmp next
+* = ( n1 n2 -- f )
+h_eq da h_dneg
+ dfb 1
+ asc "="
+cf_eq da eqw
+eqw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t1
+ cmp t2
+ bne eqf
+ lda t1+1
+ cmp t2+1
+ bne eqf
+ jmp pushf1
+eqf jmp pushf0
+* < ( n1 n2 -- f ) signed
+h_lt da h_eq
+ dfb 1
+ asc "<"
+cf_lt da ltw
+ltw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ltcmp sec
+ lda t1
+ sbc t2
+ lda t1+1
+ sbc t2+1
+ bvc lt1
+ eor #$80
+lt1 bmi ltt
+ jmp pushf0
+ltt jmp pushf1
+* 0= ( n -- f )
+h_zeq da h_lt
+ dfb 2
+ asc "0="
+cf_zeq da zeqw
+zeqw jsr pop
+ sty t1
+ sta t1+1
+ lda t1
+ ora t1+1
+ bne zeqf
+ jmp pushf1
+zeqf jmp pushf0
+* AND ( n1 n2 -- n )
+h_and da h_zeq
+ dfb 3
+ asc "AND"
+cf_and da andw
+andw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t1
+ and t2
+ tay
+ lda t1+1
+ and t2+1
+ jsr push
+ jmp next
+* OR ( n1 n2 -- n )
+h_or da h_and
+ dfb 2
+ asc "OR"
+cf_or da orw
+orw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t1
+ ora t2
+ tay
+ lda t1+1
+ ora t2+1
+ jsr push
+ jmp next
+* XOR ( n1 n2 -- n )
+h_xor da h_or
+ dfb 3
+ asc "XOR"
+cf_xor da xorw
+xorw jsr pop
+ sty t2
+ sta t2+1
+ jsr pop
+ sty t1
+ sta t1+1
+ lda t1
+ eor t2
+ tay
+ lda t1+1
+ eor t2+1
+ jsr push
+ jmp next
+* @ ( addr -- n )
+h_fet da h_xor
+ dfb 1
+ asc "@"
+cf_fet da fetw
+fetw jsr pop
+ sty t1
+ sta t1+1
+ ldy #1
+ lda (t1),y
+ pha
+ dey
+ lda (t1),y
+ tay
+ pla
+ jsr push
+ jmp next
+* ! ( n addr -- )
+h_sto da h_fet
+ dfb 1
+ asc "!"
+cf_sto da stow
+stow jsr pop
+ sty t1
+ sta t1+1
+ jsr pop
+ sty t2
+ sta t2+1
+ ldy #0
+ lda t2
+ sta (t1),y
+ iny
+ lda t2+1
+ sta (t1),y
+ jmp next
+* C@ ( addr -- b )
+h_cfet da h_sto
+ dfb 2
+ asc "C@"
+cf_cfet da cfetw
+cfetw jsr pop
+ sty t1
+ sta t1+1
+ ldy #0
+ lda (t1),y
+ tay
+ lda #0
+ jsr push
+ jmp next
+* C! ( b addr -- )
+h_csto da h_cfet
+ dfb 2
+ asc "C!"
+cf_csto da cstow
+cstow jsr pop
+ sty t1
+ sta t1+1
+ jsr pop
+ tya
+ ldy #0
+ sta (t1),y
+ jmp next
+* EMIT ( c -- ) print one character
+h_emit da h_csto
+ dfb 4
+ asc "EMIT"
+cf_emit da emitw
+emitw jsr pop
+ tya
+ ora #$80
+ jsr cout
+ jmp next
+* KEY ( -- c ) wait for a keypress
+h_key da h_emit
+ dfb 3
+ asc "KEY"
+cf_key da keyw
+keyw jsr getkey
+ and #$7f
+ tay
+ lda #0
+ jsr push
+ jmp next
+* ---- compiler words, all immediate ----
+* comphr - compile the CFA held in t1
+* IF ( -- slot ) immediate
+h_if da h_key
+ dfb $82
+ asc "IF"
+cf_if da ifw
+ifw lda #<cf_zbran
+ sta t1
+ lda #>cf_zbran
+ sta t1+1
+ jsr comma
+ lda dp+1
+ ldy dp
+ jsr push
+ stz t1
+ stz t1+1
+ jsr comma
+ jmp next
+* ELSE ( slot -- slot2 ) immediate
+h_else da h_if
+ dfb $84
+ asc "ELSE"
+cf_else da elsew
+elsew lda #<cf_bran
+ sta t1
+ lda #>cf_bran
+ sta t1+1
+ jsr comma
+ jsr pop
+ sty t2
+ sta t2+1
+ lda dp+1
+ ldy dp
+ jsr push
+ stz t1
+ stz t1+1
+ jsr comma
+ ldy #0
+ lda dp
+ sta (t2),y
+ iny
+ lda dp+1
+ sta (t2),y
+ jmp next
+* THEN ( slot -- ) immediate
+h_then da h_else
+ dfb $84
+ asc "THEN"
+cf_then da thenw
+thenw jsr pop
+ sty t1
+ sta t1+1
+ ldy #0
+ lda dp
+ sta (t1),y
+ iny
+ lda dp+1
+ sta (t1),y
+ jmp next
+* BEGIN ( -- addr ) immediate
+h_begin da h_then
+ dfb $85
+ asc "BEGIN"
+cf_begin da beginw
+beginw lda dp+1
+ ldy dp
+ jsr push
+ jmp next
+* UNTIL ( addr -- ) immediate
+h_until da h_begin
+ dfb $85
+ asc "UNTIL"
+cf_until da untilw
+untilw lda #<cf_zbran
+ sta t1
+ lda #>cf_zbran
+ sta t1+1
+ jsr comma
+ jsr pop
+ sty t1
+ sta t1+1
+ jsr comma
+ jmp next
+* WHILE ( addr -- addr slot ) immediate
+h_while da h_until
+ dfb $85
+ asc "WHILE"
+cf_while da whilew
+whilew lda #<cf_zbran
+ sta t1
+ lda #>cf_zbran
+ sta t1+1
+ jsr comma
+ lda dp+1
+ ldy dp
+ jsr push
+ stz t1
+ stz t1+1
+ jsr comma
+ jmp next
+* REPEAT ( addr slot -- ) immediate
+h_rept da h_while
+ dfb $86
+ asc "REPEAT"
+cf_rept da reptw
+reptw jsr pop
+ sty t3
+ sta t3+1
+ jsr pop
+ sty t2
+ sta t2+1
+ lda #<cf_bran
+ sta t1
+ lda #>cf_bran
+ sta t1+1
+ jsr comma
+ lda t2
+ sta t1
+ lda t2+1
+ sta t1+1
+ jsr comma
+ ldy #0
+ lda dp
+ sta (t3),y
+ iny
+ lda dp+1
+ sta (t3),y
+ jmp next
+* DO ( -- addr ) immediate
+h_do da h_rept
+ dfb $82
+ asc "DO"
+cf_do da dow
+dow lda #<cf_pdo
+ sta t1
+ lda #>cf_pdo
+ sta t1+1
+ jsr comma
+ lda dp+1
+ ldy dp
+ jsr push
+ jmp next
+* LOOP ( addr -- ) immediate
+h_loop da h_do
+ dfb $84
+ asc "LOOP"
+cf_loop da loopw
+loopw lda #<cf_ploop
+ sta t1
+ lda #>cf_ploop
+ sta t1+1
+ jsr comma
+ jsr pop
+ sty t1
+ sta t1+1
+ jsr comma
+ jmp next
+* I ( -- n ) current loop index
+h_i da h_loop
+ dfb 1
+ asc "I"
+cf_i da iw
+iw ldx lsp
+ dex
+ dex
+ dex
+ dex
+ lda loopstk+1,x
+ ldy loopstk,x
+ jsr push
+ jmp next
+* : begin a definition
+h_colon da h_i
+ dfb 1
+ asc ":"
+cf_colon da colon
+*=============================================
+* mkhead - build a dictionary header for the
+* next token in the input.
+*
+* Everything up to the code field, which is
+* the only part : and CREATE disagree about.
+* Carry set if there was no name to take.
+*=============================================
+mkhead jsr word
+ lda tlen
+ beq mkno
+ lda dp
+ sta cdef
+ lda dp+1
+ sta cdef+1
+ lda lst
+ sta t1
+ lda lst+1
+ sta t1+1
+ jsr comma
+ ldy #0
+ lda tlen
+ sta (dp),y
+ inc dp
+ bne mk1
+ inc dp+1
+mk1 ldy #0
+mknm lda (tibp),y
+ sta (dp),y
+ iny
+ cpy tlen
+ bne mknm
+ clc
+ lda dp
+ adc tlen
+ sta dp
+ bcc mk2
+ inc dp+1
+mk2 clc
+ rts
+mkno sec
+ rts
+*---- : NAME - begin a definition ----
+colon jsr mkhead
+ bcs colend
+ lda #<docol
+ sta t1
+ lda #>docol
+ sta t1+1
+ jsr comma
+ lda #1
+ sta state
+colend jmp next
+* ; immediate: end a definition
+h_semi da h_colon
+ dfb $81
+ asc ";"
+cf_semi da semi
+semi lda #<cf_exit
+ sta t1
+ lda #>cf_exit
+ sta t1+1
+ jsr comma
+ lda cdef
+ sta lst
+ lda cdef+1
+ sta lst+1
+ stz state
+ jmp next
+* BYE - return to ProDOS
+h_bye da h_semi
+ dfb 3
+ asc "BYE"
+cf_bye da byec
+byec jsr mli
+ dfb $65
+ da qparm
+ rts
+qparm dfb $04
+ dfb $00
+ da $0000
+ dfb $00
+ da $0000
+* HOME ( -- ) clear screen
+h_home da h_bye
+ dfb 4
+ asc "HOME"
+cf_home da homew
+homew jsr home
+ jmp next
+* CLEAR - forget user words + empty log
+h_clr da h_home
+ dfb 5
+ asc "CLEAR"
+cf_clr da clrw
+clrw stz envflg
+ stz shpadr             ; the data files went with
+ stz shpadr+1           ; the dictionary space they
+ stz shpend             ; were sitting in
+ stz shpend+1
+ stz sndadr
+ stz sndadr+1
+ stz sndend
+ stz sndend+1
+ lda dpboot
+ sta dp
+ lda dpboot+1
+ sta dp+1
+ lda lstboot
+ sta lst
+ lda lstboot+1
+ sta lst+1
+ lda #<srclog
+ sta logp
+ lda #>srclog
+ sta logp+1
+ jmp next
+* SAVE " NAME " - write log to a TXT file
+h_save da h_clr
+ dfb 4
+ asc "SAVE"
+cf_save da savew
+savew jsr getname
+ bcs svq
+ jsr setpth
+ jsr creatf
+ bcs svfe
+ jsr openf
+ bcs svfe
+ lda refnum
+ sta wrparm+1
+ lda #<srclog
+ sta wrparm+2
+ lda #>srclog
+ sta wrparm+3
+ sec
+ lda logp
+ sbc #<srclog
+ sta wrparm+4
+ lda logp+1
+ sbc #>srclog
+ sta wrparm+5
+ jsr mli
+ dfb $cb
+ da wrparm
+ bcc svwok
+ sta tmp
+ jsr closef
+ lda tmp
+ jmp ferr
+svwok jsr closef
+ bcs svfe
+ jsr prok
+ jmp next
+svq jmp fqerr
+svfe jmp ferr
+*=============================================
+* LOAD " NAME " - bring in a file
+*
+* One word for every kind of file, told apart
+* by the extension:
+*
+*   NAME.SHP   a block shape file
+*   NAME.SND   a tune file
+*   anything else   FORTH source
+*
+* A data file goes in at DP, and its address
+* and length are recorded in the module
+* communication block for the graphics and
+* sound modules to find. One of each is all a
+* program gets: asking twice is quietly
+* ignored, the same as GREN, so that a program
+* file which declares what it needs can be
+* LOADed again without loading it twice.
+*
+* The line is marked as a declaration so it is
+* kept in the source log. A source LOAD does
+* not need that - the text it reads goes into
+* the log itself - but a binary leaves no
+* trace there, so without this a saved program
+* would lose the very line that fetches its
+* shapes.
+*=============================================
+h_load da h_save
+ dfb 4
+ asc "LOAD"
+cf_load da loadw
+loadw jsr getname
+ bcc ldgo
+ jmp fqerr
+ldgo jsr setpth
+ jsr chkext
+ beq ldsrc              ; ordinary FORTH source
+ tax
+ dex                    ; 0 shapes, 1 tunes
+ stx t3
+ lda ldbit,x
+ and envflg
+ bne lddecl             ; already have one
+ jsr binld
+ bcc ldbok
+ jmp ferr
+ldbok ldx t3
+ ldy ldoff,x
+ lda t1
+ sta shpadr,y
+ lda t1+1
+ sta shpadr+1,y
+ lda dp
+ sta shpend,y
+ lda dp+1
+ sta shpend+1,y
+ lda ldbit,x
+ ora envflg
+ sta envflg
+lddecl lda #1
+ sta forceg
+ jmp next
+ldbit dfb $10,$20        ; which ENVFLG bit
+ldoff dfb 0,4            ; which pair of slots
+ldsrc jsr openf
+ bcc ldook
+ jmp ferr
+ldook lda refnum
+ sta rdparm+1
+ lda logp
+ sta rdparm+2
+ lda logp+1
+ sta rdparm+3
+ sec
+ lda #<logend
+ sbc logp
+ sta rdparm+4
+ lda #>logend
+ sbc logp+1
+ sta rdparm+5
+ jsr mli
+ dfb $ca
+ da rdparm
+ bcc ldrok
+ cmp #$4c
+ beq ldrok
+ sta tmp
+ jsr closef
+ lda tmp
+ jmp ferr
+ldrok jsr closef
+ lda logp
+ sta srcp
+ lda logp+1
+ sta srcp+1
+ clc
+ lda logp
+ adc rdparm+6
+ sta logp
+ lda logp+1
+ adc rdparm+7
+ sta logp+1
+ lda logp
+ sta srcend
+ lda logp+1
+ sta srcend+1
+ lda #1
+ sta nolog
+ jmp next
+* DELETE " NAME " - remove a file
+h_del da h_load
+ dfb 6
+ asc "DELETE"
+cf_del da delw
+delw jsr getname
+ bcs dlq
+ jsr setpth
+ jsr mli
+ dfb $c1
+ da dsparm
+ bcs dlfe
+ jsr prok
+ jmp next
+dlq jmp fqerr
+dlfe jmp ferr
+* CAT - list the files in the current prefix
+h_cat da h_del
+ dfb 3
+ asc "CAT"
+cf_cat da catw
+catw stz dirflg         ; CAT prints the names
+catgo0 jsr getpfx
+ bcc catgo
+ jmp ferr
+catgo lda path
+ bne catstr
+ jmp fqerr
+catstr ldx path
+ lda path,x
+ cmp #$2f
+ bne catop
+ dex
+ stx path
+catop jsr setpth
+ jsr openf
+ bcc catblk
+ jmp ferr
+catblk lda refnum
+ sta rdparm+1
+ lda #<catbuf
+ sta rdparm+2
+ lda #>catbuf
+ sta rdparm+3
+ lda #$00
+ sta rdparm+4
+ lda #$02
+ sta rdparm+5
+ jsr mli
+ dfb $ca
+ da rdparm
+ bcc catrd
+ jmp catdn
+catrd lda rdparm+6
+ ora rdparm+7
+ bne catwlk
+ jmp catdn
+catwlk lda #<catbuf+4
+ sta catp
+ lda #>catbuf+4
+ sta catp+1
+ lda #13
+ sta catn
+catent ldy #0
+ lda (catp),y
+ and #$f0
+ beq catnxt
+ cmp #$e0
+ beq catnxt
+ cmp #$f0
+ beq catnxt
+ lda (catp),y
+ and #$0f
+ beq catnxt
+ sta tmp
+ lda dirflg
+ bne catsto
+ ldy #1
+catnm lda (catp),y
+ ora #$80
+ jsr cout
+ cpy tmp
+ beq catnmd
+ iny
+ jmp catnm
+catnmd jsr crout
+ jmp catnxt
+*---- DIR keeps the name instead ----
+* Text files only - those are the ones that
+* hold programs - and fifteen of them at most,
+* which is as many as anybody wants to choose
+* between and keeps the arithmetic to shifts.
+catsto ldy #$10
+ lda (catp),y
+ cmp #$04               ; ProDOS TXT
+ bne catnxt
+ lda dirn
+ cmp #15
+ bcs catnxt
+ ldy #0
+ lda tmp                ; the counted string
+ sta (dirp),y
+catst1 iny
+ lda (catp),y
+ sta (dirp),y
+ cpy tmp
+ bne catst1
+ clc
+ lda dirp
+ adc #16
+ sta dirp
+ bcc catst2
+ inc dirp+1
+catst2 inc dirn
+catnxt clc
+ lda catp
+ adc #39
+ sta catp
+ bcc catn2
+ inc catp+1
+catn2 dec catn
+ bne catent
+ jmp catblk
+catdn jsr closef
+ lda dirflg
+ beq catdn1
+ lda #0                 ; DIR reports how many
+ ldy dirn
+ jsr push
+catdn1 jmp next
+dirflg dfb 0            ; 0 = print, 1 = collect
+dirn dfb 0              ; how many collected
+* PREFIX " /DIR/ " sets it; PREFIX shows it
+h_pref da h_cat
+ dfb 6
+ asc "PREFIX"
+cf_pref da prefw
+prefw jsr getname
+ bcs prshow
+ lda #<path
+ sta spparm+1
+ lda #>path
+ sta spparm+2
+ jsr mli
+ dfb $c6
+ da spparm
+ bcs prfe
+ jmp next
+prshow jsr getpfx
+ bcs prfe
+ ldx path
+ beq prsd
+ ldy #0
+prsl lda path+1,y
+ ora #$80
+ jsr cout
+ iny
+ dex
+ bne prsl
+prsd jsr crout
+ jmp next
+prfe jmp ferr
+* DECIMAL - base 10
+h_dec da h_pref
+ dfb 7
+ asc "DECIMAL"
+cf_dec da decw
+decw lda #10
+ sta base
+ jmp next
+* HEX - base 16
+h_hex da h_dec
+ dfb 3
+ asc "HEX"
+cf_hex da hexw
+hexw lda #16
+ sta base
+ jmp next
+* CALL ( addr -- ) jsr to machine code.
+* This is how FORTH reaches the ROM, and how
+* TEXT80 becomes a one-line definition.
+h_call da h_hex
+ dfb 4
+ asc "CALL"
+cf_call da callw
+callw jsr pop
+ sty calltg+1
+ sta calltg+2
+ jsr calltg
+ jmp next
+calltg jmp $0000
+*=============================================
+* GREN ( flag -- ) bring in the graphics
+*
+* 1 GREN loads them, 0 GREN does not. It must
+* be the FIRST word in a definition file: the
+* module lands where the dictionary would
+* otherwise begin, so anything already defined
+* would be overwritten. We check DP and refuse
+* rather than destroy someone's work.
+*
+* The point of loading rather than building in:
+* a program that never draws anything pays
+* nothing at all for the graphics.
+*=============================================
+h_gren da h_call
+ dfb 4
+ asc "GREN"
+cf_gren da grenw
+grenw ldx #1            ; ENVFLG bit 0
+ lda #<gfxnam
+ ldy #>gfxnam
+ jmp modreq
+*=============================================
+* modreq - the body GREN and SREN share
+* in: X = the ENVFLG bit, A/Y = the filename
+*
+* Always records the request, so a saved
+* program says out loud what it needs; loads
+* only on a non-zero flag; and only once.
+*=============================================
+modreq stx mrbit
+ jsr setnam
+ jsr pop
+ sty t1
+ sta t1+1
+ lda #1
+ sta forceg
+ lda t1
+ ora t1+1
+ beq mrx                ; 0 = not wanted
+ lda envflg
+ and mrbit
+ bne mrx                ; already here
+ jsr modld
+ bcs mrfe
+ lda envflg
+ ora mrbit
+ sta envflg
+mrx jmp next
+mrfe jmp ferr
+mrbit dfb 0
+gfxnam dfb 9
+ asc 'FORTH.GFX'
+*=============================================
+* BLOAD " NAME " ( -- addr )
+* Read any binary file in at the dictionary
+* pointer and push where it landed. Shapes,
+* tables, sampled data - anything. DP moves
+* past it, so definitions made afterwards sit
+* above it and CLEAR forgets the lot together.
+*=============================================
+h_bload da h_gren
+ dfb 5
+ asc "BLOAD"
+cf_bload da bldw
+bldw jsr getname
+ bcs bldq
+ jsr setpth
+ jsr binld
+ bcs bldfe
+ lda t1+1
+ ldy t1
+ jsr push
+ jmp next
+bldq jmp fqerr
+bldfe jmp ferr
+*=============================================
+* SREN ( flag -- ) bring in the sound module
+*
+* 1 SREN loads it, 0 SREN does not. Sound is
+* kept apart from graphics deliberately: GREN
+* claims both hi-res pages and puts the screen
+* into forty columns, and a program that only
+* wants to beep should not inherit any of
+* that.
+*
+* Like GREN it records the request either way,
+* so a saved program says out loud what it
+* needs, and it is harmless to ask twice.
+*=============================================
+h_sren da h_bload
+ dfb 4
+ asc "SREN"
+cf_sren da srenw
+srenw ldx #8            ; ENVFLG bit 3
+ lda #<sndnam
+ ldy #>sndnam
+ jmp modreq
+sndnam dfb 9
+ asc 'FORTH.SND'
+*=============================================
+* SEED ( n -- ) start the sequence over
+*
+* The same seed gives the same run of numbers,
+* every time. That is not a shortcoming, it is
+* the point: a game that deals a hand from a
+* seed can deal the same hand again, and a bug
+* that only shows up on one map can be looked
+* at twice.
+*
+* The top half is loaded with the complement
+* of the bottom, so that no seed - zero
+* included - can leave the register dead.
+*=============================================
+h_seed da h_sren
+ dfb 4
+ asc "SEED"
+cf_seed da seedw
+seedw jsr pop
+ sty rnd
+ sta rnd+1
+ eor #$ff
+ sta rnd+3
+ tya
+ eor #$ff
+ sta rnd+2
+ jmp next
+*=============================================
+* RND ( lo hi -- n ) a number in a range
+*
+* Inclusive at both ends: 1 6 RND rolls a die.
+*
+* The obvious way to fit a random number into
+* a range is to take the remainder after
+* dividing by it. This does not divide. It
+* multiplies the random number by the size of
+* the range and keeps the HIGH cell of the
+* 32-bit product - which is the same thing as
+* asking what fraction of the way through the
+* range the random number falls. No division,
+* and it reuses the UMUL from Part 7.
+*
+* HI must not be less than LO. Reversed, the
+* range comes out as a huge unsigned number
+* and the answer is meaningless.
+*=============================================
+h_rnd da h_seed
+ dfb 3
+ asc "RND"
+cf_rnd da rndw
+rndw jsr pop            ; hi
+ sty t1
+ sta t1+1
+ jsr pop                ; lo
+ sty t3
+ sta t3+1
+ sec                    ; range = hi - lo + 1
+ lda t1
+ sbc t3
+ sta t1
+ lda t1+1
+ sbc t3+1
+ sta t1+1
+ inc t1
+ bne rndw1
+ inc t1+1
+rndw1 lda t1
+ ora t1+1
+ beq rndwf              ; the whole cell: no scaling
+ jsr rndnxt
+ sty t2
+ sta t2+1
+ jsr umul               ; dacc = range * random
+ clc
+ lda dacc+2             ; the HIGH cell is the answer
+ adc t3
+ tay
+ lda dacc+3
+ adc t3+1
+ jsr push
+ jmp next
+rndwf jsr rndnxt
+ sty t2
+ sta t2+1
+ clc
+ lda t2
+ adc t3
+ tay
+ lda t2+1
+ adc t3+1
+ jsr push
+ jmp next
+*=============================================
+* CREATE NAME ( -- ) make a word that pushes
+* its own address
+*
+* The same header : builds, with a different
+* code field - and published at once, because
+* unlike a colon definition there is no ; to
+* wait for.
+*
+* On its own it is not much. With , and ALLOT
+* it is VARIABLE and it is arrays. With DOES>
+* it is anything at all.
+*=============================================
+h_creat da h_rnd
+ dfb 6
+ asc "CREATE"
+cf_creat da createw
+createw jsr mkhead
+ bcs crex
+ lda dp                 ; DOES> will want this
+ sta lastcf
+ lda dp+1
+ sta lastcf+1
+ lda #<dovar
+ sta t1
+ lda #>dovar
+ sta t1+1
+ jsr comma              ; the code field
+ stz t1                 ; and the DOES> cell, empty
+ stz t1+1
+ jsr comma
+ lda cdef               ; publish it
+ sta lst
+ lda cdef+1
+ sta lst+1
+crex jmp next
+lastcf da 0             ; the code field CREATE made
+*=============================================
+* DOES> ( -- ) immediate
+*
+* Everything after DOES> in a definition
+* belongs not to the word being defined but to
+* the words IT will define. Compiling it is one
+* cell; the work happens at run time, in DODO.
+*
+*   : CONSTANT CREATE , DOES> @ ;
+*
+* CONSTANT runs CREATE and , to build the new
+* word and store the value. Then DODO points
+* the new word at DODOES, hands it the address
+* of the @, and returns. The @ never runs as
+* part of CONSTANT at all - it runs later, and
+* every time, in each of CONSTANT's children.
+*=============================================
+h_does da h_creat
+ dfb $85
+ asc "DOES>"
+cf_does da doesw
+doesw lda #<cf_dodo
+ sta t1
+ lda #>cf_dodo
+ sta t1+1
+ jsr comma
+ jmp next
+*---- dpinc - one byte further along ----
+dpinc inc dp
+ bne dpi1
+ inc dp+1
+dpi1 rts
+*=============================================
+* PSTR - print the text laid down after me
+*
+* The runtime ." compiles. IP is pointing at a
+* count byte followed by that many characters,
+* which are part of the thread and must be
+* stepped over before anything else runs - so
+* the text travels WITH the code that prints
+* it, and nothing has to keep track of where
+* the strings live.
+*=============================================
+pstr ldy #0
+ lda (ip),y
+ sta t3
+ sta tmp
+ beq pstrd
+ ldy #1
+pstr1 lda (ip),y
+ jsr cout
+ iny
+ dec tmp
+ bne pstr1
+pstrd sec                ; step over count + text
+ lda ip
+ adc t3
+ sta ip
+ bcc pstr2
+ inc ip+1
+pstr2 jmp next
+cf_pstr da pstr
+*=============================================
+* ( ) - a comment, at last
+*
+* Immediate, and it simply eats input up to the
+* closing bracket. Ten lines, and the sample
+* files can finally explain themselves.
+*=============================================
+h_lparn da h_does
+ dfb $81
+ asc '('
+cf_lparn da lparnw
+lparnw jsr atend
+ bcs lprx
+ ldy #0
+ lda (srcp),y
+ jsr srcinc
+ and #$7f
+ cmp #$29 ;")"
+ bne lparnw
+lprx jmp next
+*=============================================
+* ." text" - print it
+*
+* Compiling, it lays down PSTR and the text
+* inline. Interpreting, it just prints. One
+* space after the ." is the delimiter and is
+* not part of the string; the closing quote
+* ends it.
+*=============================================
+h_dotq da h_lparn
+ dfb $82
+ asc '."'
+cf_dotq da dotqw
+dotqw jsr atend
+ bcs dqx
+ ldy #0
+ lda (srcp),y
+ and #$7f
+ cmp #$20               ; one space, skipped
+ bne dq1
+ jsr srcinc
+dq1 lda state
+ beq dqnow
+ lda #<cf_pstr
+ sta t1
+ lda #>cf_pstr
+ sta t1+1
+ jsr comma
+ lda dp                 ; the count goes here
+ sta t2
+ lda dp+1
+ sta t2+1
+ jsr dpinc
+ stz tmp
+dqc1 jsr atend
+ bcs dqc2
+ ldy #0
+ lda (srcp),y
+ jsr srcinc
+ and #$7f
+ cmp #$22 ;quote
+ beq dqc2
+ ora #$80               ; stored ready for COUT
+ ldy #0
+ sta (dp),y
+ jsr dpinc
+ inc tmp
+ bne dqc1
+dqc2 ldy #0
+ lda tmp
+ sta (t2),y
+dqx jmp next
+dqnow jsr atend
+ bcs dqx
+ ldy #0
+ lda (srcp),y
+ jsr srcinc
+ and #$7f
+ cmp #$22
+ beq dqx
+ jsr emitc
+ bra dqnow
+*=============================================
+* DIR ( -- n ) collect the text files
+*
+* The same walk CAT does, but keeping the names
+* instead of printing them. They are put at
+* HERE, sixteen bytes apiece, WITHOUT being
+* ALLOTed - scratch space above the dictionary
+* is free for the taking, right up until you
+* define something.
+*=============================================
+h_dir da h_dotq
+ dfb 3
+ asc "DIR"
+cf_dir da dirw
+dirw lda #1
+ sta dirflg
+ stz dirn
+ lda dp
+ sta dirp
+ lda dp+1
+ sta dirp+1
+ jmp catgo0
+*=============================================
+* RUN ( a -- ) load and run a named file
+*
+* LOAD takes its name from the text being
+* interpreted, which is no use to a program
+* that worked the name out for itself. RUN
+* takes a counted string from the stack
+* instead. Everything after that is LOAD.
+*
+* The name is copied into PATH first, because
+* the file is about to be interpreted and its
+* definitions will land on top of the table the
+* name came from.
+*=============================================
+h_run da h_dir
+ dfb 3
+ asc "RUN"
+cf_run da runw
+runw jsr pop            ; POP gives A=high Y=low,
+ sty t1                 ; SETNAM wants them the
+ sta t1+1               ; other way round
+ lda t1
+ ldy t1+1
+ jsr setnam
+ jsr setpth
+ jmp ldsrc
+latest equ h_run
+* relocation bounds
+kernend equ *
+klen equ kernend-run
+klast equ kstart+klen-1

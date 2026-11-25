@@ -1,0 +1,81 @@
+*=============================================
+* TUNES.SND - a tune file for FORTH.SND
+*
+* Assemble to disk under a name ending .SND
+* and LOAD will know what it is:
+*
+*   LOAD TUNES.SND
+*   0 PLAY
+*
+* Nothing here is code. It is pure data, and
+* the load address does not matter, because
+* LOAD puts it wherever the dictionary happens
+* to have got to and tells the sound module
+* where that was.
+*
+* Format, one byte at a time:
+*   $FF       end of this tune
+*   $FE t     change the timbre to t
+*   p t       play pitch p for time t
+*
+* Pitches stop at 50, so $FE and $FF can never
+* be mistaken for notes. Tunes are simply laid
+* end to end - no index, no count. The extra
+* $FF at the very end makes an empty tune, so
+* asking for a tune that is not here plays
+* silence rather than running off into memory.
+*
+* Pitch 32 is middle C and every step is a
+* semitone. Time is in units of about six
+* milliseconds: 26 is a brisk eighth note.
+*=============================================
+* Assemble this and save the object as
+* TUNES.SND. The extension is what matters -
+* the load address and file type are ignored.
+ org $2000
+*
+*---- tune 0: the scale of C ----
+ hex fe08              ; a plain timbre
+ hex 201a              ; C
+ hex 221a              ; D
+ hex 241a              ; E
+ hex 251a              ; F
+ hex 271a              ; G
+ hex 291a              ; A
+ hex 2b1a              ; B
+ hex 2c4e              ; C, held
+ hex ff
+*
+*---- tune 1: a bugle call ----
+* Only the notes of the bugle: G, C, E.
+ hex fe08
+ hex 271a              ; G
+ hex 2c1a              ; c
+ hex 301a              ; e
+ hex 2c1a              ; c
+ hex 271a              ; G
+ hex 2c4e              ; c, held
+ hex ff
+*
+*---- tune 2: a zap ----
+* Straight down the chromatic scale as fast as
+* the note timer will go.
+ hex fe02              ; the nasal timbre
+ hex 32022e022a022602
+ hex 22021e021a021602
+ hex ff
+*
+*---- tune 3: a thud ----
+* The bottom of the range, held, with the most
+* lopsided wave the routine can make.
+ hex fe02
+ hex 080605060308010c
+ hex ff
+*
+*---- tune 4: a tick ----
+ hex fe02
+ hex 0101
+ hex ff
+*
+*---- end of file ----
+ hex ff                ; an empty tune, on purpose

@@ -1,0 +1,22 @@
+( CHOOSER - list the programs on this disk and )
+( run the one that is asked for. Save it as    )
+( STARTUP and the disk becomes a menu disk.    )
+DECIMAL
+VARIABLE NPROG
+VARIABLE CH
+: SHOWN ( n -- ) DUP . SPACE NAME$ COUNT TYPE CR ;
+: HEAD CR ." Programs on this disk" CR CR ;
+: LIST
+DIR NPROG !
+NPROG @ ?DUP IF 0 DO I SHOWN LOOP THEN ;
+: ASK CR ." Which one? " KEY 48 - CH ! ;
+: OK? CH @ 0< 0= CH @ NPROG @ < AND ;
+: GO CH @ NAME$ RUN ;
+: NONE ." Nothing to run." CR ;
+: CHOOSE
+HEAD LIST
+NPROG @ 0=
+IF NONE
+ELSE BEGIN ASK OK? UNTIL CR GO
+THEN ;
+CHOOSE

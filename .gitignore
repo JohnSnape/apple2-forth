@@ -1,0 +1,28 @@
+# The public repo is the code alone (the user, 2026-11-25): the kernel,
+# the two relocatable modules, the sample programs and the build kit.
+# The magazine series and the book material stay on the work disk.
+
+# ---- the article series and the book ----
+articles/
+listings/
+docs/
+STATUS.txt
+
+# ---- third-party source material, not ours to redistribute ----
+reference/
+
+# ---- build output, all of it regenerable ----
+build/
+merlin8/
+verified/
+*.po
+*.dsk
+*.2mg
+*.png
+
+# ---- Merlin32 leftovers ----
+*_Output.txt
+*_Symbols.txt
+*_Output_Error.txt
+error_output.txt
+_FileInformation.txt

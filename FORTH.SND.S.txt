@@ -1,0 +1,488 @@
+*=============================================
+* FORTH.SND - relocatable sound module
+*
+* The music routine from Programmer's Aid #1
+* (Gary J. Shannon, 1978), which lived at
+* $D717 in a ROM most machines never had. We
+* carry the code and its note table with us.
+*
+* Assembled at ORG 0 and loaded wherever the
+* dictionary happens to start. Everything in
+* the file is an offset from the load address,
+* the ten byte header included, and MODLD adds
+* that address to every word named in the
+* fixup list at the end.
+*
+* Words: TIMBRE ( n -- )
+*        NOTE ( pitch time -- )
+*        REST ( time -- )
+*        PLAY ( n -- )
+*=============================================
+ xc                     ; 65C02 opcodes
+*
+*---- kernel jump table, frozen at $0800 ----
+kpop equ $0806          ; stack -> A=hi Y=lo
+knext equ $080c         ; the inner interpreter
+kemit equ $0812         ; print the char in A
+*
+*---- module communication block ----
+* LOAD fills these in when it recognises a
+* file called something.SND. Both are zero
+* when no tune file has been loaded.
+sndadr equ $0829        ; where the tunes are
+sndend equ $082b        ; first byte past them
+*
+*---- hardware ----
+spkr equ $c030          ; toggles the speaker
+*
+*---- zero page ----
+* The duration counter is the ONLY thing that
+* has to be here. It is stepped once round
+* every pass of the tone loop, and the cycle
+* count of that loop IS the pitch, so the one
+* cycle a zero page INC saves is not optional.
+* Everything else is touched once per note and
+* lives in the module itself.
+*
+* $fd and $fe are clear of the kernel ($06-$1f,
+* $a4-$bd, $e0, $e5, $eb-$ee, $f0-$fc) and of
+* FORTH.GFX ($cc-$e9), so a program may load
+* graphics and sound together.
+sdur equ $fd            ; note duration counter
+*
+* PLAY needs a two-byte pointer, and indirect
+* addressing can only be done through zero
+* page - but there is no free pair left. So it
+* borrows the module loader's working space,
+* which is idle from the moment a module
+* starts running. Transient use only: loading
+* a second module would land on top of it.
+tptr equ $be            ; walks along the tune
+*
+*---- fixup count ----
+* How many DA lines the fixup list at the end
+* of this file holds.  The module header below
+* publishes it, and Merlin 8 resolves an EQU on
+* its first pass - so the number has to be
+* declared before the DA that reads it.  Add a
+* fixup down there, add one to this.
+nrel equ 51
+*
+ org 0
+*
+*=============================================
+* MODULE HEADER
+*=============================================
+ da sdlast              ; newest word
+ da sdfirst             ; oldest word
+ da sdend               ; end of the image
+ da sdinit              ; set-up routine
+ da nrel                ; how many fixups
+*
+*=============================================
+* SDINIT - give TIMBRE a starting value so the
+* first NOTE anyone types makes a sound.
+*=============================================
+sdinit lda #8
+x01 sta stimb
+ rts
+*
+*=============================================
+* SPLAY - sound the note in STPIT for STTIM
+*
+* Look the pitch up, bend the duty cycle by
+* TIMBRE, set the duration counter, then run
+* the tone loop until the counter wraps.
+*
+* TIMBRE works by halving DOWNTIME repeatedly
+* and handing what it took to UPTIME:
+*   UPTIME   = original - shifted
+*   DOWNTIME = original + shifted
+* The two still add up to the same period, so
+* the PITCH does not move - only the shape of
+* the wave, and with it the harmonics. That is
+* the whole trick, and it costs eight bytes.
+*
+* DURATION counts UP from minus TIME in its
+* high byte, so it runs TIME lots of 256
+* passes. TIME 0 therefore means 256.
+*=============================================
+splay equ *
+x02 lda stpit
+ cmp #51                ; the table has 51 notes
+ bcc spl1
+ lda #0                 ; anything else is silence
+spl1 asl                ; two bytes to an entry
+ tay
+x03 lda notes,y
+x04 sta sdown
+x05 lda stimb
+sshft lsr               ; halve the timbre value
+ beq sdone              ; out of shifts
+x06 lsr sdown           ; halve DOWNTIME with it
+ bne sshft
+sdone equ *
+x07 lda notes,y
+ sec
+x08 sbc sdown           ; UPTIME = original-shifted
+x09 sta sup
+ iny
+x10 lda notes,y
+x11 adc sdown           ; DOWNTIME = original+shift
+x12 sta sdown
+ lda #0
+ sec
+x13 sbc sttim
+ sta sdur+1
+ stz sdur
+x14 lda sup
+ bne splay1
+x15 jmp srest           ; pitch 0: hold the silence
+*
+*=============================================
+* THE TONE LOOP
+*
+* Two mirrored halves. Each holds the speaker
+* still for its own count and then toggles it,
+* and both step the duration counter as they
+* go. The pitch is the number of CYCLES round
+* this loop, which is why the padding matters:
+* the NOPs make the ordinary pass and the
+* once-in-256 carry pass cost exactly what
+* they cost in the ROM, 23 and 25 cycles.
+*
+* The ROM reached its pad with a branch. We
+* use JMP, because a taken branch costs an
+* extra cycle when it crosses a page boundary,
+* and a relocatable module cannot know where
+* its page boundaries will fall. JMP is three
+* cycles wherever it lands, so the tune plays
+* in the same key at any load address.
+*=============================================
+splay1 equ *
+x16 ldy sup
+ lda spkr               ; toggle, then hold
+splay2 inc sdur         ; 5
+ beq sp2hi              ; 2
+ nop                    ; 2
+ nop                    ; 2
+ nop                    ; 2
+x17 jmp sp2go           ; 3
+sp2hi inc sdur+1        ; 5
+ beq spend              ; 2 - the note is over
+x18 jmp sp2go           ; 3
+sp2go dey               ; 2
+ beq splay0             ; 2
+x19 jmp splay2          ; 3
+*
+splay0 equ *
+x20 ldy sdown
+ lda spkr               ; toggle, then hold
+splay3 inc sdur         ; 5
+ beq sp3hi              ; 2
+ nop                    ; 2
+ nop                    ; 2
+ nop                    ; 2
+x21 jmp sp3go           ; 3
+sp3hi inc sdur+1        ; 5
+ beq spend              ; 2 - the note is over
+x22 jmp sp3go           ; 3
+sp3go dey               ; 2
+ beq splay1             ; 2
+x23 jmp splay3          ; 3
+spend rts
+*
+*=============================================
+* SREST - the same clock with the speaker left
+* alone, so a pause lasts exactly as long as a
+* note of the same TIME.
+*=============================================
+srest nop               ; 2
+ nop                    ; 2
+x24 jmp srst2           ; 3
+srst2 inc sdur          ; 5
+ beq srshi              ; 2
+ nop                    ; 2
+ nop                    ; 2
+ nop                    ; 2
+x25 jmp srest           ; 3
+srshi inc sdur+1        ; 5
+ beq spend              ; 2 - the rest is over
+x26 jmp srest           ; 3
+*
+*=============================================
+* THE NOTE TABLE
+*
+* Fifty-one entries of UPTIME, DOWNTIME. Note
+* 0 is a rest, note 32 is middle C, and every
+* step up is one semitone. The two halves are
+* equal except where an odd period has to be
+* split between them.
+*=============================================
+notes hex 0000          ; 0 rest
+ hex f6f6e8e8dbdbcfcf   ; 1-4 contra F to G#
+ hex c3c3b8b8aeae       ; 5-7 contra A to B
+ hex a4a49b9b92928a8a   ; 8-11 great C to D#
+ hex 82827b7b74746d6e   ; 12-15 great E to G
+ hex 676861625c5c5757   ; 16-19 great G# to B
+ hex 52524d4e49494545   ; 20-23 small c to d#
+ hex 41413d3e3a3a3637   ; 24-27 small e to g
+ hex 333430312e2e2b2c   ; 28-31 small g# to b
+ hex 2929262724252223   ; 32-35 middle C to d#
+ hex 20211e1f1d1d1b1c   ; 36-39 e to g
+ hex 1a1a181917171516   ; 40-43 g# to b
+ hex 141513141212       ; 44-46 two-line c to d
+ hex 111110100f100e0f   ; 47-50 d# to f#
+*
+*=============================================
+* THE DICTIONARY
+*
+* Assembled headers, ready to be hooked onto
+* the kernel's chain. The oldest word's link
+* is left at zero for MODLD to fill in, so it
+* is the one address in the file that is not
+* in the fixup list.
+*=============================================
+*
+*---- TIMBRE ( n -- ) set the tone colour ----
+* 2 is the most lopsided wave and the most
+* nasal; larger values move back towards a
+* square wave and a rounder sound. 0 and 1
+* would take the whole of UPTIME away and
+* leave silence, so they are read as 2.
+sdfirst da 0            ; MODLD patches this
+ dfb 6
+ asc "TIMBRE"
+x27 da w_timb
+w_timb jsr kpop
+ tya
+ cmp #2
+ bcs wtb1
+ lda #2
+wtb1 equ *
+x28 sta stimb
+ jmp knext
+*
+*---- NOTE ( pitch time -- ) ----
+x29 da sdfirst
+ dfb 4
+ asc "NOTE"
+x30 da w_note
+w_note jsr kpop         ; time
+ tya
+x31 sta sttim
+ jsr kpop               ; pitch
+ cmp #0                 ; over 255 is not a note
+ beq wnt1
+ ldy #255               ; let SPLAY reject it
+wnt1 equ *
+x32 sty stpit
+x33 jsr splay
+ jmp knext
+h_note equ x29
+*
+*---- REST ( time -- ) ----
+x34 da h_note
+ dfb 4
+ asc "REST"
+x35 da w_rest
+w_rest jsr kpop
+ tya
+x36 sta sttim
+x37 stz stpit
+x38 jsr splay
+ jmp knext
+h_rest equ x34
+*
+*=============================================
+* TNEXT - the next byte of the tune
+*
+* Past the end of the file every byte reads as
+* $FF, which is end-of-tune, so asking for a
+* tune the file does not hold plays silence
+* instead of marching off into the dictionary.
+* Needs no fixups: the pointer is zero page
+* and the communication block never moves.
+*=============================================
+tnext lda tptr+1
+ cmp sndend+1
+ bcc tnok
+ bne tnend
+ lda tptr
+ cmp sndend
+ bcc tnok
+tnend lda #$ff
+ rts
+tnok lda (tptr)
+ inc tptr
+ bne tn1
+ inc tptr+1
+tn1 rts
+*
+*=============================================
+* PLAY ( n -- ) sound tune n
+*
+* A tune file is nothing but sequences laid
+* end to end, exactly like the shape file. No
+* index is needed: tune n is found by counting
+* n end markers.
+*
+*   $FF        end of this tune
+*   $FE t      change the timbre to t
+*   p  t       play pitch p for time t
+*
+* Pitches only go up to 50, so the two escape
+* values can never be mistaken for notes. End
+* the whole file with one extra $FF and every
+* tune number is safe.
+*=============================================
+x39 da h_rest
+ dfb 4
+ asc "PLAY"
+x40 da w_play
+w_play jsr kpop
+ tya
+x41 sta stcnt
+ lda sndadr
+ sta tptr
+ lda sndadr+1
+ sta tptr+1
+ ora tptr               ; both zero: no file
+ beq plno
+plsk equ *
+x42 lda stcnt
+ beq plgo
+x43 dec stcnt
+plsk1 equ *
+x44 jsr tnext
+ cmp #$ff
+ bne plsk1
+ bra plsk
+plgo equ *
+x45 jsr tnext
+ cmp #$ff
+ beq plx
+ cmp #$fe
+ beq pltmb
+x46 sta stpit
+x47 jsr tnext
+x48 sta sttim
+x49 jsr splay
+ bra plgo
+pltmb equ *
+x50 jsr tnext
+ cmp #2                 ; the same floor as TIMBRE
+ bcs pltm1
+ lda #2
+pltm1 equ *
+x51 sta stimb
+ bra plgo
+plno lda #$3f ;"?"
+ jsr kemit
+plx jmp knext
+h_play equ x39
+*
+*=============================================
+* SETTINGS AND WORKING STORAGE
+*
+* UPTIME and DOWNTIME are the two halves of
+* one square wave cycle, counted in passes of
+* the tone loop. Equal halves give a square
+* wave; unequal halves give the same PITCH
+* with a different tone colour.
+*
+* THESE LIVE AT THE FAR END OF THE MODULE ON
+* PURPOSE. We assemble at ORG 0, so a label in
+* the first 256 bytes of the file has a value
+* under $100, and the assembler will quietly
+* pick zero page addressing for it - a two
+* byte instruction where we wanted three, with
+* the fixup list then pointing at the wrong
+* byte entirely. Put anything reached by a
+* plain LDA or STA out past $100 and the
+* question cannot arise. The note table is
+* safe wherever it sits because LDA absolute,Y
+* has no zero page form to be confused with.
+*
+* If you edit this file, check the listing:
+* every instruction in the fixup list must
+* still be three bytes long.
+*=============================================
+stimb dfb 8             ; timbre, set by TIMBRE
+stpit dfb 0             ; pitch of the note
+sttim dfb 0             ; how long to hold it
+sup dfb 0               ; speaker up time
+sdown dfb 0             ; speaker down time
+stcnt dfb 0             ; tunes still to skip
+*
+sdlast equ h_play
+sdend equ *
+*
+*=============================================
+* THE FIXUP LIST
+*
+* Every place inside the image that holds an
+* address. Instruction operands are one byte
+* past the opcode; DA fields are the address
+* itself. The count below must match - this
+* assembler drops the division in an
+* expression like (relend-relst)/2, so it is
+* stated outright and kept in step by hand.
+*=============================================
+relst equ *
+ da x01+1              ; sta stimb
+ da x02+1              ; lda stpit
+ da x03+1              ; lda notes,y
+ da x04+1              ; sta sdown
+ da x05+1              ; lda stimb
+ da x06+1              ; lsr sdown
+ da x07+1              ; lda notes,y
+ da x08+1              ; sbc sdown
+ da x09+1              ; sta sup
+ da x10+1              ; lda notes,y
+ da x11+1              ; adc sdown
+ da x12+1              ; sta sdown
+ da x13+1              ; sbc sttim
+ da x14+1              ; lda sup
+ da x15+1              ; jmp srest
+ da x16+1              ; ldy sup
+ da x17+1              ; jmp sp2go
+ da x18+1              ; jmp sp2go
+ da x19+1              ; jmp splay2
+ da x20+1              ; ldy sdown
+ da x21+1              ; jmp sp3go
+ da x22+1              ; jmp sp3go
+ da x23+1              ; jmp splay3
+ da x24+1              ; jmp srst2
+ da x25+1              ; jmp srest
+ da x26+1              ; jmp srest
+ da x27                ; da w_timb
+ da x28+1              ; sta stimb
+ da x29                ; da sdfirst
+ da x30                ; da w_note
+ da x31+1              ; sta sttim
+ da x32+1              ; sty stpit
+ da x33+1              ; jsr splay
+ da x34                ; da h_note
+ da x35                ; da w_rest
+ da x36+1              ; sta sttim
+ da x37+1              ; stz stpit
+ da x38+1              ; jsr splay
+ da x39                ; da h_rest
+ da x40                ; da w_play
+ da x41+1              ; sta stcnt
+ da x42+1              ; lda stcnt
+ da x43+1              ; dec stcnt
+ da x44+1              ; jsr tnext
+ da x45+1              ; jsr tnext
+ da x46+1              ; sta stpit
+ da x47+1              ; jsr tnext
+ da x48+1              ; sta sttim
+ da x49+1              ; jsr splay
+ da x50+1              ; jsr tnext
+ da x51+1              ; sta stimb
+relend equ *
+* NREL, the count of the DA lines above, is
+* declared at the top of this file, where the
+* module header can read it.  Keep the two in
+* step by hand.

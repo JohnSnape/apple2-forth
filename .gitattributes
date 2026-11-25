@@ -1,0 +1,7 @@
+# Keep every byte as it is.  The Merlin sources have to reach the disk
+# unchanged, and this project genuinely has mixed line endings:
+# FORTH.GFX.S.txt is CRLF and FORTH.SND.S.txt is LF.  Both assemble to
+# the same bytes, and git must not decide otherwise.
+* -text
+
+*.S.txt linguist-language=Assembly
